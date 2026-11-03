@@ -42,12 +42,12 @@ function parseNotebooksPage(obj: Record<string, unknown>): NotebooksPage {
                 return;
             }
             const entry: NotebookSummaryEntry = { bookId };
-            // 官方契约：书名/作者嵌套在 books[].book；兼容顶层平铺形态
+            // 官方契约：书名/作者嵌套在 books[].book（嵌套优先）；兼容顶层平铺回退形态
             const nested = isRecord(raw.book) ? raw.book : {};
-            if (typeof raw.title === "string") entry.title = raw.title;
-            else if (typeof nested.title === "string") entry.title = nested.title;
-            if (typeof raw.author === "string") entry.author = raw.author;
-            else if (typeof nested.author === "string") entry.author = nested.author;
+            if (typeof nested.title === "string") entry.title = nested.title;
+            else if (typeof raw.title === "string") entry.title = raw.title;
+            if (typeof nested.author === "string") entry.author = nested.author;
+            else if (typeof raw.author === "string") entry.author = raw.author;
             for (const field of ["reviewCount", "noteCount", "bookmarkCount", "readingProgress", "markedStatus", "sort"] as const) {
                 const value = raw[field];
                 if (typeof value === "number" && Number.isFinite(value)) {

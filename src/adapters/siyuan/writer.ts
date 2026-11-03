@@ -17,6 +17,25 @@ export class KernelApiError extends Error {
     }
 }
 
+/**
+ * PR9[3]：createDocWithMd 同路径撞上既有（他书）文档——真实内核不新建而是交回既有
+ * 文档 ID，放行会让调用方（#ensureDoc）随后 setBlockAttrs 静默改绑他书文档身份。
+ * 抛出本错误交书级重试/人工裁决；彻底防碰撞路径（路径并入 bookId）需引擎侧传参适配。
+ */
+export class DocPathCollisionError extends Error {
+    constructor(
+        public readonly docPath: string,
+        public readonly existingDocId: string,
+        public readonly reason: string,
+    ) {
+        super(
+            `文档路径 ${docPath} 已存在既有文档（${existingDocId}：${reason}），` +
+                "疑似不同书同名导致路径冲突；为防止改绑他书文档已拒绝创建，请人工处理",
+        );
+        this.name = "DocPathCollisionError";
+    }
+}
+
 interface KernelResponse {
     code: number;
     msg: string;
@@ -29,6 +48,20 @@ function isKernelResponse(v: unknown): v is KernelResponse {
     }
     const rec = v as Record<string, unknown>;
     return typeof rec.code === "number" && typeof rec.msg === "string";
+}
+
+/**
+ * "块不存在"消息特征（PR9[5]）：仓库冻结契约（docs/contracts/siyuan-kernel.md）只规定
+ * code!==0 即失败，未定义缺块专用码；真实内核 getBlockKramdown 缺块走 code 0 + 空串
+ * （见 getBlockKramdown 注释），code!=0 + 此类消息覆盖测试 FakeKernel 契约
+ * （tests/sync/engine.test.ts 返回 {code:-1, msg:"块不存在"}）及内核其他块端点的
+ * 缺块形态。特征外的 code!=0 一律视为瞬时错误抛出。
+ */
+const BLOCK_NOT_FOUND_MSG = /块不存在|not found/iu;
+
+/** SQL 字面量引号转义（SQLite '' 语义；仅用于 = 等值比较，不做 LIKE 通配转义）。 */
+function quoteSqlLiteral(text: string): string {
+    return text.replaceAll("'", "''");
 }
 
 export interface BlockOperation {
@@ -110,15 +143,49 @@ export class SiyuanWriter {
         return result;
     }
 
-    /** 创建书籍文档（空正文），返回文档根块 ID。 */
+    /**
+     * 创建书籍文档（空正文），返回文档根块 ID。
+     *
+     * PR9[3] 同路径冲突守卫：真实内核对同 path 的 createDocWithMd **不新建文档**，
+     * 而是直接返回既有文档 ID（v3.0.0 kernel/model/path.go createDocsByHPath：
+     * GetBlockTreeRootByPath 命中即 retID=root.ID；仓库契约 docs/contracts/siyuan-kernel.md
+     * 亦冻结为"同 path 重复调用不覆盖已有文档"）。因此创建后必须核对返回 ID 确为
+     * 全新文档，否则抛 DocPathCollisionError——绝不把既有文档 ID 交回调用方。
+     * 例外：同 path 的"空且无主"文档（创建窗口中断遗留）允许接管，与引擎 M4
+     * 空孤儿认领语义一致。
+     */
     async createBookDoc(notebookId: string, title: string): Promise<string> {
+        const docPath = `/${title}`;
         const data = await callKernel(this.#fn, "/api/filetree/createDocWithMd", {
             notebook: notebookId,
-            path: `/${title}`,
+            path: docPath,
             markdown: "",
         });
         // data 直接是文档 ID 字符串
-        return assertBlockId(data, "createDocWithMd");
+        const docId = assertBlockId(data, "createDocWithMd");
+        await this.#assertCreatedDocIsFresh(docId, docPath);
+        return docId;
+    }
+
+    /**
+     * 核对 createDocWithMd 返回的 ID 确为全新文档（PR9[3]）：
+     * - 已有子块 → 撞上既有书籍文档（骨架/条目已在）；
+     * - 已带 custom-wrs-book-id 身份属性 → 撞上他书（或本书旧档）的已绑定文档。
+     * 两种情况都抛 DocPathCollisionError；SQL 瞬时失败也会自然抛错由书级重试兜底。
+     */
+    async #assertCreatedDocIsFresh(docId: string, docPath: string): Promise<void> {
+        const children = await this.sql(
+            `select id from blocks where root_id='${quoteSqlLiteral(docId)}' and id != '${quoteSqlLiteral(docId)}'`,
+        );
+        if (children.length > 0) {
+            throw new DocPathCollisionError(docPath, docId, "文档已含子内容");
+        }
+        const bound = await this.sql(
+            `select id from blocks where id='${quoteSqlLiteral(docId)}' and ial like '%custom-wrs-book-id="%' escape '\\'`,
+        );
+        if (bound.length > 0) {
+            throw new DocPathCollisionError(docPath, docId, "文档已带 custom-wrs-book-id 身份");
+        }
     }
 
     /** 在 previousID 后插入块，返回新块 ID。 */
@@ -164,18 +231,52 @@ export class SiyuanWriter {
         await callKernel(this.#fn, "/api/attr/setBlockAttrs", { id: blockId, attrs });
     }
 
-    /** 回读块 kramdown；块不存在返回 undefined（存在性证据以此为准）。 */
+    /**
+     * 回读块 kramdown（存在性证据以此为准）。三态契约（PR9[5]）：
+     *
+     * 1. 存在：code 0 且 data.kramdown 为非空字符串 → 返回该字符串。
+     * 2. 确认不存在 → 返回 undefined，仅限两种可确认形态：
+     *    (a) code 0 且 kramdown 为空串——真实内核（v2.12.8/v3.0.0/master 的
+     *        kernel/api/block.go getBlockKramdown → model.GetBlockKramdown）对缺失块
+     *        正是返回 code 0 + 空串，并非 code!=0。已知局限：该形态在真实内核同时
+     *        覆盖"块缺失"与"树加载失败"，本端点无更强信号可区分，按缺失处理
+     *        （引擎侧如需绝对稳妥可在判 user-deleted 前用 getBlockInfo 复核）；
+     *    (b) code!=0 且 msg 匹配块不存在/not found 特征——测试 FakeKernel 契约形态
+     *        及内核其他块端点（如 getBlockInfo 缺块返回 code -1 + 查询失败消息）。
+     * 3. 其他一切错误（code!=0 的其他消息=瞬时内核故障、传输异常、响应形状异常）
+     *    → 抛 KernelApiError，由调用方按书级重试处理。绝不把瞬时故障折算成
+     *    "块不存在"——否则 #auditBlocks 会把条目永久误判 user-deleted。
+     */
     async getBlockKramdown(blockId: string): Promise<string | undefined> {
+        const path = "/api/block/getBlockKramdown";
+        let resp: unknown;
         try {
-            const data = await callKernel(this.#fn, "/api/block/getBlockKramdown", { id: blockId });
-            const rec = data as Record<string, unknown> | null;
-            return rec !== null && typeof rec.kramdown === "string" ? rec.kramdown : undefined;
+            resp = await this.#fn(path, { id: blockId });
         } catch (e) {
-            if (e instanceof KernelApiError && typeof e.code === "number" && e.code !== 0) {
-                return undefined;
-            }
-            throw e;
+            throw new KernelApiError(`内核请求失败 ${path}：${toSafeErrorMessage(e)}`, path);
         }
+        if (!isKernelResponse(resp)) {
+            throw new KernelApiError(`内核响应格式异常 ${path}`, path);
+        }
+        if (resp.code !== 0) {
+            if (BLOCK_NOT_FOUND_MSG.test(resp.msg)) {
+                return undefined; // 确认不存在（形态 b）
+            }
+            throw new KernelApiError(
+                `内核错误 ${path} code=${resp.code}：${toSafeErrorMessage(resp.msg)}`,
+                path,
+                resp.code,
+            );
+        }
+        const rec = resp.data as Record<string, unknown> | null;
+        if (rec === null || typeof rec.kramdown !== "string") {
+            // code 0 但形状异常：无法确认块存在性 → 保守抛错（不折算成"不存在"）
+            throw new KernelApiError(`${path} 响应缺少 kramdown 字符串，无法确认块状态`, path);
+        }
+        if (rec.kramdown === "") {
+            return undefined; // 确认不存在（形态 a：真实内核缺块形态）
+        }
+        return rec.kramdown;
     }
 
     /** 取块直接信息（parent_id/root_id，用于 moved-out 判定）。 */

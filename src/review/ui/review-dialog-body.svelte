@@ -114,7 +114,13 @@
         item.notice = "";
         item.noticeKind = "info";
         try {
-            const result = await applyDecision(item.sourceKey, action, manualText);
+            // PR10[2]：决策显式携带"展示时快照"（用户据以决策的 local 与远端指纹）——
+            // 其它条目刷新（refreshItem/重开对话框）不得替换本条目锚定的快照，
+            // 中间发生的本地编辑一律按过期拒绝重审，绝不静默覆盖（AGENTS.md L19）。
+            const result = await applyDecision(item.sourceKey, action, manualText, {
+                local: item.local,
+                remoteFingerprint: item.remoteFingerprint,
+            });
             if (result.ok) {
                 removeView(item.sourceKey);
                 return;

@@ -82,11 +82,11 @@ describe("OpLog append/complete/fail", () => {
         expect(log.pending()).toHaveLength(0);
     });
 
-    it("未知 opId：complete/fail 均 throw", async () => {
+    it("未知 opId：complete 保持 throw；fail 容忍（PR#9 评审修复——中断恢复不得被缺失日志卡死）", async () => {
         const log = new OpLog(async () => {}, []);
         await log.append(baseEntry("op-1"));
         await expect(log.complete("nope", {})).rejects.toThrow(/opId/);
-        await expect(log.fail("nope", "x")).rejects.toThrow(/opId/);
+        await expect(log.fail("nope", "x")).resolves.toBeUndefined();
     });
 
     it("initial 载入：entries/pending 正确反映初值", async () => {
@@ -136,5 +136,17 @@ describe("OpLog 环形上限", () => {
         await log.fail("op-1", "失败");
         expect(rec.persisted).toHaveLength(3);
         expect(rec.persisted[2].map((e) => e.status)).toEqual(["failed", "pending"]);
+    });
+});
+
+describe("PR#9 评审修复：fail 对未知 opId 容忍", () => {
+    it("store.save(pending) 与 append 之间中断（条目缺失）→ fail 合成 failed 条目而非抛错", async () => {
+        const rec = recorder();
+        const log = new OpLog(rec.persist, []);
+        await expect(log.fail("op-ghost-9999", "中断于落块前，已清除意图")).resolves.toBeUndefined();
+        // 合成条目被追加并持久化，保留审计痕迹
+        const last = rec.persisted[rec.persisted.length - 1]!;
+        expect(last.some((e) => e.opId === "op-ghost-9999" && e.status === "failed")).toBe(true);
+        expect(log.entries().some((e) => e.opId === "op-ghost-9999" && e.status === "failed")).toBe(true);
     });
 });

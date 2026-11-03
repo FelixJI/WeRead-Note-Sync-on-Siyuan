@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { HttpTextResponse, Transport } from "../../src/core/net/transport";
 import { fetchBookmarkList, listAllReviewsRaw } from "../../src/adapters/weread/bookmarks";
+import type { BookmarkListResult } from "../../src/adapters/weread/bookmarks";
+import { normalizeHighlight } from "../../src/sync/model";
+import type { BookSourceDetail, NormalizedHighlight } from "../../src/sync/model";
+import { computePlan } from "../../src/sync/plan";
 
 const KEY = "wrk-test-key-0001";
 
@@ -125,12 +129,82 @@ describe("fetchBookmarkList（/book/bookmarklist）", () => {
     });
 });
 
+// 模拟引擎 #fetchDetail → computePlan 的前半段（纯函数，不触内核）：
+// 证明去重发生在 computePlan 输入之前、异常经现有门禁语义使整书不进写入阶段
+function planFromFetch(bm: BookmarkListResult) {
+    const highlights: NormalizedHighlight[] = [];
+    const itemErrors: string[] = [];
+    for (const raw of bm.rawItems) {
+        const n = normalizeHighlight(raw, bm.chapters);
+        if (n.ok) highlights.push(n.value);
+        else itemErrors.push(n.error);
+    }
+    const anomalies = bm.anomalies;
+    const detail: BookSourceDetail = {
+        bookId: "BID",
+        highlights,
+        reviews: [],
+        anomalies,
+        itemErrors,
+        complete: bm.complete && anomalies.length === 0,
+    };
+    return computePlan({ state: undefined, detail, round: 1, accountNamespace: "acct" });
+}
+
+describe("updated[] 同 bookmarkId 去重（PR9[8]）", () => {
+    it("同一 bookmarkId 完全重复出现 → 只保留一次，computePlan 只建一次块", async () => {
+        const t = scriptedTransport([
+            () =>
+                jsonBody({
+                    errcode: 0,
+                    updated: [bm("h1"), bm("h1"), bm("h2")],
+                    chapters: [{ chapterUid: 1, chapterIdx: 1, title: "第一章" }],
+                }),
+        ]);
+        const result = await fetchBookmarkList(t, KEY, "BID");
+        expect(result.rawItems).toHaveLength(2);
+        expect(result.rawItems.filter((r) => r.bookmarkId === "h1")).toHaveLength(1);
+        expect(result.anomalies).toEqual([]);
+        expect(result.complete).toBe(true);
+        // 去重后进入 computePlan：h1 只产出一次 create，不产生重复块/重复挂靠
+        const plan = planFromFetch(result);
+        expect(plan.skipped).toBe(false);
+        const h1Creates = plan.creates.filter(
+            (c) => c.officialSourceId === "h1",
+        );
+        expect(h1Creates).toHaveLength(1);
+        expect(plan.creates.map((c) => c.officialSourceId).sort()).toEqual(["h1", "h2"]);
+    });
+
+    it("同一 bookmarkId 载荷冲突 → 保留首个并记 anomaly，整书不进写入阶段", async () => {
+        const t = scriptedTransport([
+            () =>
+                jsonBody({
+                    errcode: 0,
+                    updated: [bm("h1"), bm("h1", { markText: "被篡改的文本" }), bm("h2")],
+                    chapters: [{ chapterUid: 1, chapterIdx: 1, title: "第一章" }],
+                }),
+        ]);
+        const result = await fetchBookmarkList(t, KEY, "BID");
+        // 适配器层：保留首个载荷 + ambiguousId 异常（不静默）
+        expect(result.rawItems).toHaveLength(2);
+        expect(result.rawItems.find((r) => r.bookmarkId === "h1")?.markText).toBe("文本-h1");
+        expect(result.anomalies.some((a) => a.includes("ambiguousId") && a.includes("h1"))).toBe(
+            true,
+        );
+        // 现有 anomaly 门禁语义：anomalies 非空 → complete=false → computePlan 整书跳过、零动作
+        const plan = planFromFetch(result);
+        expect(plan.skipped).toBe(true);
+        expect(plan.creates).toEqual([]);
+        expect(plan.skipReason).toContain("整书跳过");
+    });
+});
+
 describe("listAllReviewsRaw（/review/list/mine 原始条目）", () => {
-    it("raws 保形：外层 abstract/range 与内层 .review.reviewId/content 原样保留", async () => {
+    it("raws 保形：内层 .review.reviewId/content/abstract/range 与顶层 chapterUid/createTime 原样保留", async () => {
+        // 官方契约形态：abstract/range 嵌套在 .review 内
         const item1 = {
-            review: { reviewId: "r1", content: "想法一", star: 3 },
-            abstract: "划线原文一",
-            range: "100-200",
+            review: { reviewId: "r1", content: "想法一", star: 3, abstract: "划线原文一", range: "100-200" },
             chapterUid: 1,
             createTime: 1700000000,
         };
@@ -143,7 +217,7 @@ describe("listAllReviewsRaw（/review/list/mine 原始条目）", () => {
         expect(result.anomalies).toEqual([]);
         expect(result.raws).toEqual([item1, item2]);
         // 未做任何裁剪：嵌套对象与顶层字段逐字段一致
-        expect(result.raws[0].abstract).toBe("划线原文一");
+        expect((result.raws[0].review as Record<string, unknown>).abstract).toBe("划线原文一");
         expect((result.raws[0].review as Record<string, unknown>).content).toBe("想法一");
         // 契约：参数全小写 bookid
         const body = bodyAsRecord(t.calls[0]);

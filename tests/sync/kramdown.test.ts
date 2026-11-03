@@ -31,8 +31,30 @@ describe("escapeKramdownText 注入防护", () => {
         expect(escapeKramdownText("* 强调")).toBe("\\* 强调");
         expect(escapeKramdownText("+ 列表")).toBe("\\+ 列表");
         expect(escapeKramdownText("1. 有序")).toBe("1\\. 有序");
-        expect(escapeKramdownText("*em*")).toBe("\\*em*");
+        // PR9[13]：行内 * 同样转义（不再只转义行首那一个）
+        expect(escapeKramdownText("*em*")).toBe("\\*em\\*");
         expect(escapeKramdownText("12. 数字")).toBe("12\\. 数字");
+    });
+
+    it("PR9[13]：行内图片/链接定界符被转义，导入后是字面文本而非真图片/真链接", () => {
+        // ![img](url)：转义 [ 后无法构成图片语法
+        expect(escapeKramdownText("![img](https://example.com/tracker.png)")).toBe(
+            "!\\[img](https://example.com/tracker.png)",
+        );
+        // [label](siyuan://...)：转义 [ 后无法构成链接语法
+        expect(escapeKramdownText("[label](siyuan://blocks/20240101)")).toBe(
+            "\\[label](siyuan://blocks/20240101)",
+        );
+        // 行中（非行首）出现的图片/链接同样不得成形
+        expect(escapeKramdownText("前面有字 ![img](https://e.com/p.png) 后面有字")).toBe(
+            "前面有字 !\\[img](https://e.com/p.png) 后面有字",
+        );
+    });
+
+    it("PR9[13]：行内强调/代码/删除线/上下标定界符被转义", () => {
+        expect(escapeKramdownText("*强调* 与 _下划线_")).toBe("\\*强调\\* 与 \\_下划线\\_");
+        expect(escapeKramdownText("含 `代码` 片段")).toBe("含 \\`代码\\` 片段");
+        expect(escapeKramdownText("~~删除线~~ 与 x^2^")).toBe("\\~\\~删除线\\~\\~ 与 x\\^2\\^");
     });
 
     it("缩进行首标记同样转义", () => {
@@ -76,6 +98,18 @@ describe("kramdown 渲染函数", () => {
         expect(renderHighlightBlock("# 标题注入")).toBe("> \\# 标题注入");
         expect(renderHighlightBlock("行一\n<script>alert(1)</script>")).toBe(
             "> 行一\n> \\<script>alert(1)\\</script>",
+        );
+    });
+
+    it("PR9[13]：renderHighlightBlock 输出的图片/链接串是字面文本", () => {
+        expect(renderHighlightBlock("看这 ![img](https://e.com/p.png) 和 [label](siyuan://blocks/x)")).toBe(
+            "> 看这 !\\[img](https://e.com/p.png) 和 \\[label](siyuan://blocks/x)",
+        );
+    });
+
+    it("PR9[13]：renderReviewChild 输出的链接/强调串是字面文本", () => {
+        expect(renderReviewChild("参考 [这篇](siyuan://blocks/x)，*重点*")).toBe(
+            "- 💭 参考 \\[这篇](siyuan://blocks/x)，\\*重点\\*",
         );
     });
 

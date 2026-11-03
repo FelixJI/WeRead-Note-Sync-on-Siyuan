@@ -4,9 +4,18 @@
      * - 数据经注入的 loadData（collectStats）；远端数值纯文本插值（零 @html）。
      * - 热力图区分 value/zero/unknown/future（不只靠颜色：unknown 带纹理符号、future 空白+说明）。
      * - 年份切换重新加载；年份提示经 title 属性（无悬浮环境亦可见文本行）。
+     * - PR12[9]：请求代际守卫（纯状态机在 stats/pure，可独立测试）——加载中禁用刷新，
+     *   且旧请求（历史年）即使晚于新请求完成也无法覆盖新结果/提前清 loading。
      */
     import type { StatsResult } from "../stats/service";
-    import { formatDuration, formatProgress } from "../stats/pure";
+    import {
+        beginDialogLoad,
+        formatDuration,
+        formatProgress,
+        initialDialogLoadState,
+        settleDialogLoad,
+        type DialogLoadState,
+    } from "../stats/pure";
 
     export interface BookStatRow {
         title: string;
@@ -24,9 +33,10 @@
     let { i18n, loadData, loadBooks, onClose }: Props = $props();
 
     let books = $state<BookStatRow[]>([]);
-    let loading = $state(false);
-    let error = $state("");
-    let result = $state<StatsResult | null>(null);
+    let loadState = $state<DialogLoadState<StatsResult>>(initialDialogLoadState());
+    const loading = $derived(loadState.loading);
+    const error = $derived(loadState.error);
+    const result = $derived(loadState.result);
 
     const levelOf = (seconds: number): number =>
         seconds === 0 ? 0 : seconds < 1800 ? 1 : seconds < 3600 ? 2 : seconds < 10800 ? 3 : 4;
@@ -39,14 +49,13 @@
     };
 
     async function load(year?: number): Promise<void> {
-        loading = true;
-        error = "";
+        loadState = beginDialogLoad(loadState);
+        const generation = loadState.generation; // 本次请求的代际：完成后仅当仍是最新才回写
         try {
-            result = await loadData(year);
+            const value = await loadData(year);
+            loadState = settleDialogLoad(loadState, generation, { ok: true, value });
         } catch (e) {
-            error = (e as Error).message;
-        } finally {
-            loading = false;
+            loadState = settleDialogLoad(loadState, generation, { ok: false, message: (e as Error).message });
         }
     }
 
@@ -67,7 +76,7 @@
             <span class="wrns-stats-year">{result?.heatmapYear.year ?? "…"}</span>
             <button type="button" class="b3-button b3-button--outline" disabled={loading || (result !== null && result.heatmapYear.year >= new Date().getUTCFullYear())}
                 onclick={() => void load((result?.heatmapYear.year ?? 2025) + 1)}>{i18n.statsNextYear} →</button>
-            <button type="button" class="b3-button b3-button--outline" onclick={() => void load(undefined)}>{i18n.statsRefresh}</button>
+            <button type="button" class="b3-button b3-button--outline" disabled={loading} onclick={() => void load(undefined)}>{i18n.statsRefresh}</button>
             <button type="button" class="b3-button b3-button--cancel" onclick={onClose}>✕</button>
         </div>
     </div>

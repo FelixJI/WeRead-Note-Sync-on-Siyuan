@@ -68,11 +68,14 @@ export class OpLog {
         await this.persistFn([...this.items]);
     }
 
-    /** 失败：status→failed + error。未知 opId throw。 */
+    /** 失败：status→failed + error。未知 opId 容忍（PR#9 评审修复：
+     * store.save(pending) 与 oplog.append 之间崩溃会留下无日志条目的持久意图，
+     * reconcile 期间的 fail 不再抛错卡死该书；合成一条 failed 条目保留审计痕迹）。 */
     async fail(opId: string, error: string): Promise<void> {
         const index = this.lastIndexOfOpId(opId);
         if (index < 0) {
-            throw new Error(`oplog.fail：未知 opId ${opId}`);
+            await this.append({ opId, ts: new Date().toISOString(), intent: "create-block", status: "failed", error: `意图无对应日志条目（写入中断）：${error}` });
+            return;
         }
         this.items[index] = { ...this.items[index], error, status: "failed" };
         await this.persistFn([...this.items]);

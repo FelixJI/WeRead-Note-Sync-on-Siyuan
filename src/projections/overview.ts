@@ -17,6 +17,8 @@
  *   同属性多块（伪装/复制属性）→ 跳过+上报，绝不任选，绝不碰无属性块（AC3）。
  * - 任何写失败 → 安全停（本轮投影中止，不影响同步本体结果；引擎捕获计为 warning）。
  * - 用户复盘区（notes）创建后投影永不触碰；总览丢失 → 重建骨架并如实上报（复盘区重建为占位）。
+ *   骨架四区（stats/books/recent/notes）首次全部建成后落盘 custom-wrs-init="done" 标记，
+ *   区分"初始化未完成"（补建骨架，PR11[7]）与"初始化已完成后复盘区缺失"（用户删除，不复活）。
  */
 import { likeEscape, type SiyuanWriter } from "../adapters/siyuan/writer";
 import type { OpLog } from "../sync/oplog";
@@ -91,12 +93,39 @@ function sanitizeRefLabel(text: string): string {
         .trim();
 }
 
-/** 行内文本安全化（meta 段落）：单行、无 `<`、无 IAL 形态 */
+/**
+ * 行内文本安全化（meta 段落）：单行、纯字面文本（PR11[1] 整改）。
+ * 远端作者名等来源文本中的 Markdown 元字符（图片 `![a](u)`、链接 `[a](u)`、
+ * 强调 `*`/`_`/`~~`、行内代码、autolink、IAL 前缀、行内公式 `$` 等）一律全角化，
+ * 使其成为字面字符——注入后不构成任何可渲染语法（AGENTS.md L17 远端文本纯文本纪律）。
+ * 采用全角化而非反斜杠转义：与 sanitizeRefLabel 同源约定——真实内核 format renderer
+ * 会做 HTML 实体转义/归一化，反斜杠转义无法保证回读全等；全角字符原样落地、原样回读。
+ */
+const INLINE_MARKDOWN_FULLWIDTH: Record<string, string> = {
+    "\\": "＼",
+    "`": "｀",
+    "*": "＊",
+    "_": "＿",
+    "~": "～",
+    "[": "［",
+    "]": "］",
+    "(": "（",
+    ")": "）",
+    "!": "！",
+    "<": "＜",
+    ">": "＞",
+    "&": "＆",
+    '"': "＂",
+    "'": "＇",
+    "{": "｛",
+    "}": "｝",
+    $: "＄",
+};
+
 function sanitizeInlineText(text: string): string {
     return text
         .replace(/[\u0000-\u001F\u007F]/g, " ")
-        .replace(/</g, "＜")
-        .replace(/\{:/g, "｛:")
+        .replace(/[\\`*_~[\]()!<>&"'{}$]/g, (ch) => INLINE_MARKDOWN_FULLWIDTH[ch] ?? ch)
         .replace(/\s+/g, " ")
         .trim();
 }
@@ -387,31 +416,52 @@ async function updateProjectionBlock(
     ctx.countWrite();
 }
 
-/** 总览文档定位/创建：index 缓存（回读核实）→ 属性 SQL 找回 → 重建骨架 */
-async function resolveOverviewDoc(ctx: ProjectionCtx): Promise<{ docId: string; created: boolean }> {
+/**
+ * 总览文档定位/创建：index 缓存（回读核实 + 重复身份检查）→ 属性 SQL 找回（回读验归属）→ 重建骨架。
+ * initDone：custom-wrs-init="done" 标记（骨架四区首次全部建成后落盘）——
+ * 区分"初始化未完成"（补建骨架）与"用户本地删除复盘区"（不复活，AGENTS.md L19）。
+ */
+async function resolveOverviewDoc(
+    ctx: ProjectionCtx,
+): Promise<{ docId: string; created: boolean; initDone: boolean }> {
     const { writer, index } = ctx.deps;
     const ns = index.accountNamespace;
     if (index.overviewDocId !== undefined) {
-        const kramdown = await writer.getBlockKramdown(index.overviewDocId);
+        const cachedId = index.overviewDocId;
+        const kramdown = await writer.getBlockKramdown(cachedId);
         // 审阅整改 MINOR-2：缓存命中须验属性（防属性被清/错乱文档被当总览写入骨架）
-        if (
-            kramdown !== undefined &&
-            extractIalAttr(kramdown, "custom-wrs-overview") === "1" &&
-            extractIalAttr(kramdown, "custom-wrs-account") === ns
-        ) {
-            return { docId: index.overviewDocId, created: false };
+        if (kramdown !== undefined && isOverviewOwner(kramdown, ns)) {
+            // PR11[4] 整改：缓存命中同样做重复身份检查——用户复制总览（带属性）后，
+            // 多份 custom-wrs-overview 身份必须按歧义语义安全停，不得绕过 SQL 唯一性检查。
+            // SQL 行不作为存在性证据：除缓存外的候选逐一回读核实，回读可验才计为重复。
+            const others = (await findOverviewDocIds(ctx)).filter((id) => id !== cachedId);
+            for (const id of others) {
+                const other = await writer.getBlockKramdown(id);
+                if (other !== undefined && isOverviewOwner(other, ns)) {
+                    throw new ProjectionStopError(
+                        "发现多份总览文档（custom-wrs-overview 属性歧义），投影安全停待人工处理",
+                    );
+                }
+            }
+            return { docId: cachedId, created: false, initDone: isInitDone(kramdown) };
         }
     }
-    const rows = await writer.sql(
-        `select id from blocks where type='d' and ial like '%custom-wrs-overview="1"%' escape '\\' and ial like '%custom-wrs-account="${likeEscape(ns)}"%' escape '\\'`,
-    );
+    const rows = await findOverviewDocIds(ctx);
     if (rows.length > 1) {
         throw new ProjectionStopError("发现多份总览文档（custom-wrs-overview 属性歧义），投影安全停待人工处理");
     }
     if (rows.length === 1) {
-        const kramdown = await writer.getBlockKramdown(rows[0].id);
+        const docId = rows[0]!;
+        const kramdown = await writer.getBlockKramdown(docId);
         if (kramdown !== undefined) {
-            return { docId: rows[0].id, created: false };
+            // PR11[6] 整改：SQL 恢复路径与缓存路径同规——回读校验 custom-wrs-overview 与
+            // custom-wrs-account 归属；不符（属性被清/篡改而索引滞留旧值）→ 安全停，绝不写入。
+            if (!isOverviewOwner(kramdown, ns)) {
+                throw new ProjectionStopError(
+                    "总览文档归属校验失败（custom-wrs-overview/custom-wrs-account 与 SQL 索引不符，疑似属性被清除或篡改），投影安全停",
+                );
+            }
+            return { docId, created: false, initDone: isInitDone(kramdown) };
         }
         // SQL 命中但回读失败（索引滞后或已删）：不写该块，走重建
     }
@@ -431,7 +481,7 @@ async function resolveOverviewDoc(ctx: ProjectionCtx): Promise<{ docId: string; 
             if (children.length === 0) {
                 await writer.setBlockAttrs(cand, { "custom-wrs-overview": "1", "custom-wrs-account": ns });
                 ctx.anomalies.push("认领了创建中断遗留的空总览孤儿文档");
-                return { docId: cand, created: true };
+                return { docId: cand, created: true, initDone: false };
             }
         }
     }
@@ -451,11 +501,7 @@ async function resolveOverviewDoc(ctx: ProjectionCtx): Promise<{ docId: string; 
             "custom-wrs-account": ns,
         });
         const kramdown = await writer.getBlockKramdown(docId);
-        if (
-            kramdown === undefined ||
-            extractIalAttr(kramdown, "custom-wrs-overview") !== "1" ||
-            extractIalAttr(kramdown, "custom-wrs-account") !== ns
-        ) {
+        if (kramdown === undefined || !isOverviewOwner(kramdown, ns)) {
             throw new Error("总览文档属性回读校验失败");
         }
         await ctx.deps.oplog.complete(opId, { blockId: docId });
@@ -468,7 +514,58 @@ async function resolveOverviewDoc(ctx: ProjectionCtx): Promise<{ docId: string; 
     if (lost) {
         ctx.anomalies.push("总览文档曾丢失，已重建骨架（用户复盘区重建为占位文本）");
     }
-    return { docId: createdId, created: true };
+    // PR11[2] 整改（已落地，此为契约注释）：创建且回读已验证后直接返回该 docId，
+    // 不再以 SQL 二次查询取 docId——SQL 索引滞后时会拿到空结果，破坏骨架创建与缓存。
+    return { docId: createdId, created: true, initDone: false };
+}
+
+/** 按 custom-wrs-overview="1" + 账号命名空间查总览文档块 ID（SQL 仅为线索，存在性以回读为准） */
+async function findOverviewDocIds(ctx: ProjectionCtx): Promise<string[]> {
+    const ns = ctx.deps.index.accountNamespace;
+    const rows = await ctx.deps.writer.sql(
+        `select id from blocks where type='d' and ial like '%custom-wrs-overview="1"%' escape '\\' and ial like '%custom-wrs-account="${likeEscape(ns)}"%' escape '\\'`,
+    );
+    return rows.map((r) => r.id);
+}
+
+/** 回读 kramdown 的总览归属校验：custom-wrs-overview="1" 且 custom-wrs-account=本账号 */
+function isOverviewOwner(kramdown: string, ns: string): boolean {
+    return (
+        extractIalAttr(kramdown, "custom-wrs-overview") === "1" &&
+        extractIalAttr(kramdown, "custom-wrs-account") === ns
+    );
+}
+
+/** 初始化完成标记（custom-wrs-init="done"）：骨架四区首次全部建成后落盘 */
+function isInitDone(kramdown: string): boolean {
+    return extractIalAttr(kramdown, "custom-wrs-init") === "done";
+}
+
+/**
+ * 落盘初始化完成标记：意图先行 → setBlockAttrs → 回读核对 → 记账。
+ * 此标记之后复盘区缺失才按"用户本地删除"处理（不自动复活，AGENTS.md L19）。
+ */
+async function markOverviewInitDone(ctx: ProjectionCtx, docId: string): Promise<void> {
+    const opId = ctx.deps.newOpId();
+    await ctx.deps.oplog.append({
+        opId,
+        ts: ctx.deps.now(),
+        intent: "project",
+        payloadText: `setBlockAttrs custom-wrs-init=done ${docId}`,
+        status: "pending",
+    });
+    try {
+        await ctx.deps.writer.setBlockAttrs(docId, { "custom-wrs-init": "done" });
+        const kramdown = await ctx.deps.writer.getBlockKramdown(docId);
+        if (kramdown === undefined || !isInitDone(kramdown)) {
+            throw new Error("初始化完成标记回读校验失败");
+        }
+    } catch (e) {
+        await ctx.deps.oplog.fail(opId, (e as Error).message);
+        throw new ProjectionStopError(`总览初始化标记写入失败：${(e as Error).message}`);
+    }
+    await ctx.deps.oplog.complete(opId, { blockId: docId });
+    ctx.countWrite();
 }
 
 /** 骨架区确保：按 custom-wrs-section 找/建；歧义 → undefined（已上报） */
@@ -573,18 +670,25 @@ export async function projectOverview(deps: ProjectOverviewDeps): Promise<Projec
         overviewDocId = resolved.docId;
 
         // stats 槽位（本任务仅占位，永不更新；T05 填充真实数据）
-        await ensureSection(ctx, resolved.docId, "stats", texts.statsPlaceholder);
+        const statsSectionId = await ensureSection(ctx, resolved.docId, "stats", texts.statsPlaceholder);
 
-        // 用户复盘区：存在即永不触碰（AC3）；首建随骨架创建；存量文档缺失 → 不自动复活，如实上报
+        // 用户复盘区：存在即永不触碰（AC3）；首建随骨架创建。
+        // PR11[7] 整改：区分"初始化未完成"（custom-wrs-init 标记未落盘 → 骨架此前创建中断，
+        // 补建而非误报删除）与"初始化已完成后缺失"（疑似用户删除 → 不自动复活，如实上报）。
+        let notesPresent = false;
         const notesIds = await findAttrBlockIds(ctx, resolved.docId, "custom-wrs-section", "notes");
         if (notesIds.length === 1) {
-            // 投影永不触碰
+            notesPresent = true; // 投影永不触碰
         } else if (notesIds.length > 1) {
             anomalies.push("复盘区属性歧义（多块），未触碰");
-        } else if (resolved.created) {
+        } else if (resolved.created || !resolved.initDone) {
             await createProjectionBlock(ctx, resolved.docId, texts.notesSectionHint, {
                 "custom-wrs-section": "notes",
             });
+            notesPresent = true;
+            if (!resolved.created) {
+                anomalies.push("复盘区因初始化未完成而补建（此前骨架创建中断，并非用户删除）");
+            }
         } else {
             anomalies.push("复盘区缺失（疑似被用户删除），按纪律不自动重建、不触碰");
         }
@@ -656,6 +760,18 @@ export async function projectOverview(deps: ProjectOverviewDeps): Promise<Projec
                     });
                 }
             }
+        }
+
+        // ---- 5. 初始化完成标记（PR11[7]）：骨架四区俱全 → 首次一次性落盘 custom-wrs-init ----
+        // 此后复盘区缺失即按用户删除纪律处理（不自动复活，AGENTS.md L19）；任一区缺失/歧义则不落标记。
+        if (
+            !resolved.initDone &&
+            statsSectionId !== undefined &&
+            notesPresent &&
+            booksContainerId !== undefined &&
+            recentContainerId !== undefined
+        ) {
+            await markOverviewInitDone(ctx, resolved.docId);
         }
     } catch (e) {
         error = e instanceof ProjectionStopError ? e.message : `投影失败（安全停）：${(e as Error).message}`;

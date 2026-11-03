@@ -208,6 +208,40 @@ describe("微信读书网关契约", () => {
         expect(() => parseGatewayJson("这不是JSON")).toThrow(TransportError);
     });
 
+    it("非 JSON 回包中 API Key 横跨 80 字符边界 → 先脱敏后截断，错误消息不含 wrk- 残段", () => {
+        // PR8[2]：69 个填充字符 + wrk-abcdefgh 共 81 字符；若先截断后脱敏，
+        // 剩余 7 字符后缀不满足脱敏器 8 字符要求，wrk-abcdefg 将泄露进错误消息
+        const leak = "wrk-abcdefgh";
+        const bodyText = `${"x".repeat(69)}${leak}`;
+        let captured: unknown;
+        try {
+            parseGatewayJson(bodyText);
+        } catch (e) {
+            captured = e;
+        }
+        expect(captured).toBeInstanceOf(TransportError);
+        const message = (captured as TransportError).message;
+        expect(message).not.toContain("wrk-abcdefg");
+        // wrk- 之后不得再跟任何密钥材质字符（脱敏标记后的 * 不算泄露）
+        expect(message).not.toMatch(/wrk-[0-9A-Za-z]/);
+    });
+
+    it("合法 JSON 但非对象（数组）且回显跨边界 Key → 同样先脱敏后截断，不泄露残段", () => {
+        // 数组前缀 73 字符，使 wrk-abcdefgh 横跨截断边界（截断后仅剩 7 字符后缀）
+        const leak = "wrk-abcdefgh";
+        const bodyText = `["${"x".repeat(67)}", "${leak}"]`;
+        let captured: unknown;
+        try {
+            parseGatewayJson(bodyText);
+        } catch (e) {
+            captured = e;
+        }
+        expect(captured).toBeInstanceOf(TransportError);
+        const message = (captured as TransportError).message;
+        expect(message).not.toContain("wrk-abcdefg");
+        expect(message).not.toMatch(/wrk-[0-9A-Za-z]/);
+    });
+
     it("isValidWereadApiKey：wrk- 前缀、总长 >= 12、无空白", () => {
         expect(isValidWereadApiKey("wrk-abcdefgh")).toBe(true);
         expect(isValidWereadApiKey("wrk-abcdefgh1")).toBe(true);

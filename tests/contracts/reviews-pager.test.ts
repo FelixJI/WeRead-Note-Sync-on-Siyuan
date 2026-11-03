@@ -32,9 +32,10 @@ function jsonBody(obj: unknown, status = 200): HttpTextResponse {
     return { status, body: JSON.stringify(obj), contentType: "application/json" };
 }
 
-// /review/list/mine 回包条目：reviewId 在 review 内，abstract/range 是顶层条件字段
+// /review/list/mine 回包条目（官方契约）：reviewId/abstract/range 均嵌套在 review 对象内；
+// abstract/range 是条件字段（整本书评/章节点评可能缺失）
 function rv(reviewId: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
-    return { review: { reviewId, ...extra }, abstract: `摘要-${reviewId}` };
+    return { review: { reviewId, abstract: `摘要-${reviewId}`, ...extra } };
 }
 
 function bodyAsRecord(call: RecordedCall): Record<string, unknown> {
@@ -84,12 +85,36 @@ describe("想法分页（/review/list/mine）", () => {
                     errcode: 0,
                     hasMore: 0,
                     synckey: "",
-                    reviews: [{ review: {}, abstract: "无ID" }, rv("ok")],
+                    reviews: [{ review: { abstract: "无ID" } }, rv("ok")],
                 }),
         ]);
         const result = await listAllReviewsForBook(t, KEY, "BID");
         expect(result.reviews.map((r) => r.reviewId)).toEqual(["ok"]);
         expect(result.anomalies.some((a) => a.includes("reviewId"))).toBe(true);
+    });
+
+    it("官方契约：abstract/range 从 reviews[].review 嵌套对象读取（PR8[4] 防回归）", async () => {
+        const t = scriptedTransport([
+            () =>
+                jsonBody({
+                    errcode: 0,
+                    hasMore: 0,
+                    synckey: "",
+                    reviews: [
+                        { review: { reviewId: "r1", abstract: "划线原文", range: "100-200" } },
+                        // 整本书评：无对应划线，abstract/range 缺失属正常，不记异常
+                        { review: { reviewId: "r2" } },
+                    ],
+                }),
+        ]);
+        const result = await listAllReviewsForBook(t, KEY, "BID");
+        expect(result.anomalies).toEqual([]);
+        const r1 = result.reviews.find((r) => r.reviewId === "r1");
+        expect(r1?.abstract).toBe("划线原文");
+        expect(r1?.range).toBe("100-200");
+        const r2 = result.reviews.find((r) => r.reviewId === "r2");
+        expect(r2?.abstract).toBeUndefined();
+        expect(r2?.range).toBeUndefined();
     });
 
     it("连续两页全部条目无效（空键集）且 synckey 前进 → 不误判整页重复，正常翻页完成", async () => {

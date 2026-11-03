@@ -36,11 +36,12 @@ import {
 } from "./kramdown";
 import { computePlan, type SyncPlan } from "./plan";
 import { OpLog, type OpLogEntry } from "./oplog";
+import { UpgradeRequiredError } from "../adapters/weread/gateway";
 import { makeSourceKey, parseSourceKey, type SourceKind } from "./identity";
 import { classifyConflict, renderManualMerge } from "../review/model";
 import { projectOverview, type BookProjectionInfo, type RecentHighlightCandidate } from "../projections/overview";
 import { collectStats } from "../stats/service";
-import { WRITER_LEASE_MS, newWriterIdentity, checkOrClaimWriter } from "./writer-guard";
+import { newWriterIdentity, checkOrClaimWriter } from "./writer-guard";
 
 export interface SyncEngineDeps {
     persistence: StatePersistence;
@@ -173,6 +174,10 @@ export class SyncEngine {
     readonly #deps: SyncEngineDeps;
     readonly #writer: SiyuanWriter;
     readonly #writerIdentity: { writerId: string; label: string };
+    /** 既有章节内的链式插入游标（docId|章节标题 → 最近插入块）：保持同轮多条先后顺序 */
+    readonly #lastChapterAnchor = new Map<string, string>();
+    /** PR#10 评审修复：按书串行化决策（读-改-写整书状态无 CAS，并发决策会互相覆盖） */
+    readonly #decisionLocks = new Map<string, Promise<unknown>>();
 
     constructor(deps: SyncEngineDeps) {
         this.#deps = deps;
@@ -290,7 +295,13 @@ export class SyncEngine {
         const deferredBooks = total - picked.length;
 
         let ok = true;
+        // PR#9 评审修复：网关要求升级（upgrade_info）→ 立即整轮中止，
+        // 不继续请求/导入后续书（docs/contracts/weread-gateway.md 的立即暂停要求），并透出升级指引
+        let abortUpgrade: UpgradeRequiredError | undefined;
         for (const entry of picked) {
+            if (abortUpgrade !== undefined) {
+                break;
+            }
             let bookOutcome: BookSyncOutcome;
             try {
                 const r = await this.#syncBook(
@@ -303,6 +314,10 @@ export class SyncEngine {
                 index = r.index;
                 bookOutcome = r.outcome;
             } catch (e) {
+                if (e instanceof UpgradeRequiredError) {
+                    abortUpgrade = e;
+                    break;
+                }
                 // 书级异常隔离：一本书失败不影响其他书（部分成功语义）
                 bookOutcome = {
                     bookId: entry.bookId,
@@ -325,10 +340,24 @@ export class SyncEngine {
             }
         }
 
+        if (abortUpgrade !== undefined) {
+            return {
+                ok: false,
+                abortedReason: `网关要求升级（upgrade_info），整轮立即中止，未继续同步后续书：${abortUpgrade.message}`,
+                books,
+                deferredBooks,
+                candidatesReport: [],
+                protectedReport: [],
+            };
+        }
+
         // T04：轮末总览投影（失败不影响同步本体结果；投影只写带插件属性的块）
         let projectionErrors = 0;
         const projectionAnomalies: string[] = [];
-        if (this.#deps.projectOverview !== false && index.notebookId !== undefined && total > 0) {
+        // PR#11 评审修复：本轮书目为空但 index 已有书时仍投影——否则最后一本书
+        // 从书目消失时残留条目永远收不到"⚠ 来源未返回"标记（unseen 补充循环被 total>0 短路）
+        const hasProjectionTarget = total > 0 || Object.keys(index.books).length > 0;
+        if (this.#deps.projectOverview !== false && index.notebookId !== undefined && hasProjectionTarget) {
             try {
                 const roundBookIds = new Set(notebooks.books.map((b) => b.bookId));
                 const outcomeByBook = new Map(books.map((b) => [b.bookId, b]));
@@ -579,6 +608,10 @@ export class SyncEngine {
         try {
             detail = await this.#fetchDetail(bookId);
         } catch (e) {
+            if (e instanceof UpgradeRequiredError) {
+                // PR#9 评审修复：升级要求穿透书级隔离，由 syncRound 整轮中止
+                throw e;
+            }
             return {
                 outcome: {
                     ...outcome,
@@ -774,10 +807,12 @@ export class SyncEngine {
         const kind = this.#kindOf(pending.sourceKey);
         const item: ItemState = {
             kind,
-            sourcePayload: {},
+            // PR#9 评审修复：还原意图自带的原始载荷与指纹——空载荷+"adopted" 指纹会让
+            // 已核对条目在后续轮永续误判 source-changed（旧状态无此字段时回退旧值）
+            sourcePayload: pending.payload ?? {},
             renderedText: pending.payloadText,
             localBaseline: stripIal(kramdown),
-            versionFingerprint: "adopted",
+            versionFingerprint: pending.fingerprint ?? "adopted",
             status: "active",
             override: false,
             lastSeenRound: state.generation,
@@ -920,7 +955,7 @@ export class SyncEngine {
         // 文档创建窗口兜底（整改 M4：仅认领"空且无主"的孤儿文档）：
         // 非空的同名文档视为用户文档冲突——不认领、不新建，交人工处理
         if (index.notebookId !== undefined) {
-            const sanitized = sanitizeDocTitle(title, bookId);
+            const sanitized = this.#docTitle(title, bookId);
             const byTitle = await this.#writer.sql(
                 `select id from blocks where type='d' and content='${sqlEscape(sanitized)}' and box='${sqlEscape(index.notebookId)}' and ial not like '%custom-wrs-book-id=%'`,
             );
@@ -959,7 +994,7 @@ export class SyncEngine {
         await oplog.append({ opId, ts: this.#now(), intent: "create-doc", status: "pending" });
         const docId = await this.#writer.createBookDoc(
             index.notebookId ?? "",
-            sanitizeDocTitle(title, bookId),
+            this.#docTitle(title, bookId),
         );
         await this.#writer.setBlockAttrs(docId, {
             "custom-wrs-book-id": bookId,
@@ -995,7 +1030,15 @@ export class SyncEngine {
         const opId = this.#opId();
         const pending: BookSyncState = {
             ...state,
-            pendingOp: { opId, sourceKey: create.sourceKey, payloadText, startedAt: this.#now() },
+            pendingOp: {
+                opId,
+                sourceKey: create.sourceKey,
+                payloadText,
+                startedAt: this.#now(),
+                // PR#9 评审修复：意图随身携带原始载荷与指纹，收养时还原基线（见 #reconcilePendingOp）
+                payload: create.payload,
+                fingerprint: fingerprintPayload(create.payload),
+            },
         };
         await store.save(pending);
         await oplog.append({
@@ -1008,6 +1051,19 @@ export class SyncEngine {
         });
 
         try {
+            // PR#9 评审修复（挂靠父块状态检查）：挂靠目标必须仍是 active 的受管块——
+            // 隔离/已删/移出（moved-out）的父块绝不能再接收子想法（防写入用户移入的其它文档）；
+            // 父块不可用时该想法改为独立渲染，不落入挂靠路径
+            const parentKey =
+                create.kind === "review" && create.matchedHighlightBlockHint !== undefined
+                    ? this.#sourceKey(bookId, "highlight", create.matchedHighlightBlockHint)
+                    : undefined;
+            const parentItem =
+                parentKey !== undefined
+                    ? state.items[parentKey] ?? pending.items[parentKey]
+                    : undefined;
+            const attachParentId = parentItem?.status === "active" ? parentItem?.blockId : undefined;
+
             let anchorId: string | undefined;
             if (create.kind === "highlight" && create.chapter !== undefined) {
                 // 章节标题去重：同文档同内容标题已存在则不重复插入（blocks.content 为纯文本）
@@ -1019,10 +1075,16 @@ export class SyncEngine {
                         renderChapterHeading(create.chapter.title),
                         docId,
                     );
+                } else {
+                    // PR#9 评审修复（既有章节内插入）：章节已存在时同样锚定到该章节内部
+                    // （标题之后），不再落入文档末尾；同轮多条经链式游标保持先后顺序
+                    anchorId =
+                        this.#lastChapterAnchor.get(`${docId}|${create.chapter.title}`) ??
+                        existing[0]?.id;
                 }
             }
-            if (create.kind === "review" && create.matchedHighlightBlockHint === undefined) {
-                // 独立想法：懒建"想法"区标题
+            if (create.kind === "review" && attachParentId === undefined) {
+                // 独立想法（无挂靠目标，或挂靠父块非 active）：懒建"想法"区标题
                 const existing = await this.#writer.sql(
                     `select id from blocks where root_id='${sqlEscape(docId)}' and type='h' and content='${sqlEscape(REVIEW_SECTION_TEXT)}'`,
                 );
@@ -1035,15 +1097,10 @@ export class SyncEngine {
             // 这是"写入成功但响应丢失"可恢复的前提——无属性的无名块无法被 SQL 认领，必然重复创建
             const finalMarkdown = `${payloadText} {: custom-wrs-src="${create.sourceKey}"}`;
 
-            // 步骤 2：创建块（review 挂靠须父块已存在——两段排序保证）
+            // 步骤 2：创建块（review 挂靠须父块已存在且 active——两段排序保证）
             let blockId: string;
-            if (create.kind === "review" && create.matchedHighlightBlockHint !== undefined) {
-                const parentKey = this.#sourceKey(bookId, "highlight", create.matchedHighlightBlockHint);
-                const parentBlock = state.items[parentKey]?.blockId ?? pending.items[parentKey]?.blockId;
-                if (parentBlock === undefined) {
-                    return { state: pending, error: `挂靠父块不存在：${parentKey}` };
-                }
-                blockId = await this.#writer.appendChildBlock(finalMarkdown, parentBlock);
+            if (attachParentId !== undefined) {
+                blockId = await this.#writer.appendChildBlock(finalMarkdown, attachParentId);
             } else if (anchorId !== undefined) {
                 blockId = await this.#writer.insertBlockAfter(finalMarkdown, anchorId);
             } else {
@@ -1054,6 +1111,10 @@ export class SyncEngine {
             const kramdown = await this.#writer.getBlockKramdown(blockId);
             if (kramdown === undefined) {
                 return { state: pending, error: `回读失败 blockId=${blockId}` };
+            }
+            if (create.kind === "highlight" && anchorId !== undefined && create.chapter !== undefined) {
+                // 链式游标：同章节后续新增插在本块之后，保持本轮内的先后顺序
+                this.#lastChapterAnchor.set(`${docId}|${create.chapter.title}`, blockId);
             }
 
             // 步骤 4：记账 + 推进基线（记账前中断由重入 reconcile 收养，不重复创建）
@@ -1154,7 +1215,12 @@ export class SyncEngine {
                 if (item.pendingRemote === undefined || item.blockId === undefined || item.status !== "active") {
                     continue; // 审阅整改 M4：非 active（隔离/已删/移出）不入审阅队列
                 }
-                const kramdown = await this.#writer.getBlockKramdown(item.blockId);
+                let kramdown: string | undefined;
+                try {
+                    kramdown = await this.#writer.getBlockKramdown(item.blockId);
+                } catch {
+                    kramdown = undefined; // 单条读取失败不阻塞整个队列（展示回退基线快照）
+                }
                 const local = kramdown !== undefined ? stripIal(kramdown) : item.localBaseline ?? "";
                 const baseline = item.localBaseline ?? "";
                 const conflict = classifyConflict(baseline, local, item.pendingRemote.renderedText);
@@ -1182,6 +1248,30 @@ export class SyncEngine {
      * expectedFingerprint 为决策时远端版本（会话缓存），不一致同样过期重审（整改 INFO9）。
      */
     async applyDecision(
+        sourceKey: string,
+        action: "apply-remote" | "keep-local" | "manual-merge" | "save-copy" | "defer",
+        manualText: string | undefined,
+        expectedLocal: string,
+        expectedFingerprint?: string,
+    ): Promise<ApplyResult> {
+        // PR#10 评审修复：同书决策串行化——UI 只禁用当前条目，用户可对同书两个条目并发提交；
+        // 每次决策独立"读→改→写"整书状态且存储无 CAS，后保存者会静默覆盖前者的决策与候选
+        const bookId = parseSourceKey(sourceKey).bookId;
+        const gate = this.#decisionLocks.get(bookId) ?? Promise.resolve();
+        const run = gate.then(() =>
+            this.#applyDecisionUnlocked(sourceKey, action, manualText, expectedLocal, expectedFingerprint),
+        );
+        this.#decisionLocks.set(
+            bookId,
+            run.then(
+                () => undefined,
+                () => undefined,
+            ),
+        );
+        return run;
+    }
+
+    async #applyDecisionUnlocked(
         sourceKey: string,
         action: "apply-remote" | "keep-local" | "manual-merge" | "save-copy" | "defer",
         manualText: string | undefined,
@@ -1221,21 +1311,26 @@ export class SyncEngine {
         if (action === "defer") {
             return { ok: true };
         }
-        // 审阅整改 M2：单写入端守卫同样约束决策写入路径（他端活跃租约 → 拒绝写入）
+        // 审阅整改 M2 + PR#13 评审修复：决策写入统一走 claim-and-persist——
+        // 他端活跃租约拒绝；无主/过期先认领再写；本端决策顺带续约 lastSeenAt。
+        // （此前仅拒绝活跃他端，无主/过期时不认领也不续约，决策可与随后抢注的同步轮写同一书状态）
         {
-            const index = await this.#indexStore().load();
-            const holder = index?.writer;
-            if (
-                index !== undefined &&
-                holder !== undefined &&
-                holder.writerId !== this.#writerIdentity.writerId &&
-                (Date.parse(this.#now()) || Date.now()) - holder.lastSeenAt < WRITER_LEASE_MS
-            ) {
-                return {
-                    ok: false,
-                    kind: "not-found",
-                    message: `另一写入端（${holder.label}）持有同步权，本端为只读；决策写入被拒绝`,
-                };
+            const indexStore = this.#indexStore();
+            const index = await indexStore.load();
+            if (index !== undefined) {
+                const nowMs = Date.parse(this.#now()) || Date.now();
+                const check = checkOrClaimWriter(index, this.#writerIdentity, nowMs);
+                if (!check.ok && check.reason === "conflict") {
+                    return {
+                        ok: false,
+                        kind: "not-found",
+                        message: `另一写入端（${check.holder.label}）持有同步权，本端为只读；决策写入被拒绝`,
+                    };
+                }
+                if (!check.ok) {
+                    return { ok: false, kind: "not-found", message: check.message };
+                }
+                await indexStore.save({ ...index, writer: check.claim });
             }
         }
         if (action === "keep-local") {
@@ -1257,6 +1352,30 @@ export class SyncEngine {
         if (action === "save-copy") {
             if (state.docId === undefined) {
                 return { ok: false, kind: "not-found", message: "书籍文档未确定，无法另存副本" };
+            }
+            // PR#10 评审修复（副本对账）：上一轮"写入成功但回读失败"的副本已带 custom-wrs-copy-of
+            // 溯源属性落地；重试前先查证同文本副本，命中即收养记账，绝不重复建第二份副本
+            const copies = await this.#writer.sql(
+                `select id from blocks where ial like '%custom-wrs-copy-of="${likeEscape(sourceKey)}"%' escape '\\'`,
+            );
+            for (const row of copies) {
+                const k = await this.#writer.getBlockKramdown(row.id);
+                if (k !== undefined && stripIal(k) === stripIal(item.pendingRemote.renderedText)) {
+                    await oplog.append({
+                        opId: this.#opId(),
+                        ts: this.#now(),
+                        intent: "decision",
+                        sourceKey,
+                        blockId: row.id,
+                        status: "done",
+                        error: "save-copy：收养上轮已落地但回读失败的副本",
+                    });
+                    item.versionFingerprint = item.pendingRemote.fingerprint;
+                    item.override = true;
+                    item.pendingRemote = undefined;
+                    await store.save(state);
+                    return { ok: true };
+                }
             }
             // 副本带 custom-wrs-copy-of 溯源属性，不带 custom-wrs-src——不建第二规范映射
             const copyMarkdown = `${item.pendingRemote.renderedText} {: custom-wrs-copy-of="${sourceKey}"}`;
@@ -1310,7 +1429,13 @@ export class SyncEngine {
     ): Promise<ApplyResult> {
         const blockId = item.blockId!;
         // 步骤 2 前置重读：现状必须等于决策时快照（过期计划拒绝，AC4）
-        const current = await this.#writer.getBlockKramdown(blockId);
+        // PR9-5 契约适配：瞬时内核读取错误（KernelApiError）≠ 块缺失——返回可重试失败，不动任何状态
+        let current: string | undefined;
+        try {
+            current = await this.#writer.getBlockKramdown(blockId);
+        } catch (e) {
+            return { ok: false, kind: "kernel", message: `更新前重读失败（未改动任何状态，可重试）：${(e as Error).message}` };
+        }
         if (current === undefined) {
             return { ok: false, kind: "missing", message: "目标块不存在（可能已被删除）" };
         }
@@ -1343,7 +1468,18 @@ export class SyncEngine {
             const markdown = `${newRendered} {: id="${blockId}" custom-wrs-src="${sourceKey}"}`;
             await this.#writer.updateBlockContent(markdown, blockId);
             // 步骤 4：回读验证（内容 + 同 ID 可读 + 身份属性保留）
-            const after = await this.#writer.getBlockKramdown(blockId);
+            // PR9-5 契约适配：验证回读抛错（瞬时故障）与"确认不可读"同轨——意图留存，下轮核对
+            let after: string | undefined;
+            try {
+                after = await this.#writer.getBlockKramdown(blockId);
+            } catch (e) {
+                await oplog.fail(opId, `验证回读异常（意图留存待下轮核对）：${(e as Error).message}`);
+                return {
+                    ok: false,
+                    kind: "kernel",
+                    message: "更新后验证回读失败，已留存意图，下轮同步核对后恢复",
+                };
+            }
             if (after === undefined) {
                 // 验证回读不可得（块缺失或读取异常）≠ 验证逻辑失败：
                 // 不判死、不隔离——意图留存，下轮 reconcile 按块实况裁决（落地→收养/未落地→重议/缺失→隔离）
@@ -1355,11 +1491,19 @@ export class SyncEngine {
                 };
             }
             if (
-                stripIal(after) !== newRendered ||
+                // PR#10 评审修复：期望内容与回读同口径归一化——远端文本尾随空白不应判为更新失败
+                stripIal(after) !== stripIal(newRendered) ||
                 this.#extractIalAttr(after, "custom-wrs-src") !== sourceKey
             ) {
-                // 回读成功但 ID 变化/属性丢失/内容不符 → 隔离 + 保留快照（oplog 含 before/after）+ 上报，不自动补救写
+                // 回读成功但 ID 变化/属性丢失/内容不符 → 隔离 + 保留快照 + 上报，不自动补救写
+                // PR#10 评审修复：完整 before/after 存入 recovery 持久保留（oplog 会截断/轮换，不足恢复用）
                 item.status = "quarantined";
+                item.recovery = {
+                    before: item.pendingUpdate.before,
+                    after: item.pendingUpdate.after,
+                    reason: "更新后回读验证失败（ID/属性/内容未保持）",
+                    quarantinedAt: this.#now(),
+                };
                 item.pendingUpdate = undefined;
                 item.pendingRemote = undefined;
                 await store.save(state);
@@ -1371,7 +1515,7 @@ export class SyncEngine {
                 };
             }
             // 步骤 5：记账推进（指纹=已处理远端版本；sourcePayload=远端载荷，供后续 diff 基准）
-            item.renderedText = newRendered;
+            item.renderedText = stripIal(after);
             item.localBaseline = stripIal(after);
             item.sourcePayload = remotePayload;
             item.versionFingerprint = remoteFingerprint;
@@ -1403,6 +1547,12 @@ export class SyncEngine {
             const kramdown = await this.#writer.getBlockKramdown(item.blockId);
             if (kramdown === undefined) {
                 item.status = "quarantined";
+                item.recovery = {
+                    before: pending.before,
+                    after: pending.after,
+                    reason: "更新中断：目标块不可读，隔离待人工裁决",
+                    quarantinedAt: this.#now(),
+                };
                 item.pendingUpdate = undefined;
                 quarantined += 1;
                 changed = true;
@@ -1410,12 +1560,12 @@ export class SyncEngine {
             }
             const stripped = stripIal(kramdown);
             if (
-                stripped === pending.after &&
+                stripped === stripIal(pending.after) &&
                 this.#extractIalAttr(kramdown, "custom-wrs-src") === sourceKey
             ) {
                 // 更新已落地且身份保持：补记账推进基线（审阅整改 M2：收养须补完身份验证——
                 // 否则丢身份的块被当健康块收养，对审计/重建 SQL 永久不可见）
-                item.renderedText = pending.after;
+                item.renderedText = stripIal(pending.after);
                 item.localBaseline = stripped;
                 item.sourcePayload = pending.remotePayload;
                 item.versionFingerprint = pending.remoteFingerprint;
@@ -1423,7 +1573,7 @@ export class SyncEngine {
                 item.pendingRemote = undefined;
                 changed = true;
             } else if (
-                stripped === pending.before &&
+                stripped === stripIal(pending.before) &&
                 this.#extractIalAttr(kramdown, "custom-wrs-src") === sourceKey
             ) {
                 // 未落地（身份保持）：清除意图，候选保留待重议（复核随行：before 分支同样校验身份）
@@ -1432,6 +1582,12 @@ export class SyncEngine {
             } else {
                 // 内容落地但身份丢失，或不可解释状态 → 隔离待人工裁决
                 item.status = "quarantined";
+                item.recovery = {
+                    before: pending.before,
+                    after: pending.after,
+                    reason: "更新中断：内容/身份无法解释，隔离待人工裁决",
+                    quarantinedAt: this.#now(),
+                };
                 item.pendingUpdate = undefined;
                 quarantined += 1;
                 changed = true;
@@ -1477,6 +1633,18 @@ export class SyncEngine {
     /** T05：更新总览 stats 槽位（仅带插件属性的块；歧义/缺失→跳过不写） */
     async #updateStatsSlot(overviewDocId: string, snapshotText: string, ns: string): Promise<void> {
         const esc = (x: string): string => x.replaceAll("'", "''");
+        // PR#12 评审修复（归属校验）：缓存 overviewDocId 的所有权独立验证——
+        // 本轮投影被跳过/失败时不得只凭缓存 ID 写入，属性被改的文档绝不碰
+        const docKramdown = await this.#writer.getBlockKramdown(overviewDocId);
+        if (docKramdown === undefined) {
+            return; // 总览不可读：跳过（不写不明文档）
+        }
+        if (
+            this.#extractIalAttr(docKramdown, "custom-wrs-overview") !== "1" ||
+            this.#extractIalAttr(docKramdown, "custom-wrs-account") !== ns
+        ) {
+            throw new Error("总览文档归属校验失败（custom-wrs-overview/custom-wrs-account 不符），统计槽位拒写");
+        }
         const rows = await this.#writer.sql(
             `select id, ial, markdown from blocks where root_id='${esc(overviewDocId)}' and ial like '%custom-wrs-section="stats"%' escape '\'`,
         );
@@ -1491,7 +1659,9 @@ export class SyncEngine {
         if (this.#extractIalAttr(kramdown, "custom-wrs-section") !== "stats") {
             return; // 归属不符，绝不碰
         }
-        const next = `${snapshotText} {: id="${target.id}" custom-wrs-section="stats" custom-wrs-account="${ns}"}`;
+        // PR#12 评审修复：IAL 必须独立成行置于闭合栅栏之后——
+        // 追加在 ``` 结尾行会让该行成为代码内容，内核收到未闭合代码块
+        const next = `${snapshotText}\n{: id="${target.id}" custom-wrs-section="stats" custom-wrs-account="${ns}"}`;
         await this.#writer.updateBlockContent(next, target.id);
         const after = await this.#writer.getBlockKramdown(target.id);
         if (after === undefined || stripIal(after).trim() !== snapshotText.trim()) {
@@ -1503,6 +1673,10 @@ export class SyncEngine {
     async listBookSummaries(limit = 10): Promise<Array<{ bookId: string; title: string }>> {
         const index = await this.#indexStore().load();
         if (index === undefined) {
+            return [];
+        }
+        // PR#12 评审修复：账号不符（改配置未迁移 index）时不得把旧账号书目喂给新 Key 的请求
+        if (index.accountNamespace !== this.#deps.accountNamespace) {
             return [];
         }
         return Object.entries(index.books)
@@ -1523,6 +1697,13 @@ export class SyncEngine {
     }
 
     // ---------- 小工具 ----------
+
+    /** PR9-3 评审修复：文档标题并入 bookId——不同 bookId 的同名书（或清洗后同名）
+     *  不再共享同一路径（真实内核对同 path 重复 createDocWithMd 返回既有文档 ID，
+     *  会静默改绑第一本书的身份属性）。writer 层 DocPathCollisionError 为第二道防线。 */
+    #docTitle(title: string, bookId: string): string {
+        return `${sanitizeDocTitle(title, bookId)} (${bookId})`;
+    }
 
     #withItem(state: BookSyncState, key: string, mut: (item: ItemState) => void): BookSyncState {
         const existing: ItemState = state.items[key] ?? {

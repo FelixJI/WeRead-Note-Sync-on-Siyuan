@@ -52,12 +52,14 @@ export function parseGatewayJson(bodyText: string): Record<string, unknown> {
     try {
         parsed = JSON.parse(bodyText);
     } catch {
+        // 先对完整文本脱敏再截断：若先截断，横跨 80 字符边界的 Key 会因后缀
+        // 不足 8 字符而逃过脱敏器，泄露残段（AGENTS.md 安全不变量 2）
         throw new TransportError(
-            `网关响应不是合法 JSON：${redact(bodyText.slice(0, 80))}`,
+            `网关响应不是合法 JSON：${redact(bodyText).slice(0, 80)}`,
         );
     }
     if (!isRecord(parsed)) {
-        throw new TransportError(`网关响应不是 JSON 对象：${redact(bodyText.slice(0, 80))}`);
+        throw new TransportError(`网关响应不是 JSON 对象：${redact(bodyText).slice(0, 80)}`);
     }
     return parsed;
 }

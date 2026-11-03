@@ -3,12 +3,15 @@ import { assertWhitelistedUrl } from "./whitelist";
 
 // 内核 forwardProxy 的请求形状（docs/contracts/siyuan-kernel.md）：
 // headers 是"单键对象数组"（内核逐项合并），与外层 Record 形式不同，需在此转换。
+// redirect 必须显式传 false：内核默认跟随重定向，且重定向目标不会重新过
+// assertWhitelistedUrl——禁用重定向让越权目标失败关闭（fail closed）。
 export type ForwardProxyFn = (req: {
     url: string;
     method: string;
     timeout: number;
     contentType: string;
     headers: Record<string, string>[];
+    redirect: boolean;
     payload: unknown;
     payloadEncoding: "json";
     responseEncoding: "text";
@@ -35,6 +38,7 @@ export function createKernelForwardProxyTransport(
                 timeout,
                 contentType: "application/json",
                 headers: headerList,
+                redirect: false,
                 payload: body,
                 payloadEncoding: "json",
                 responseEncoding: "text",

@@ -45,6 +45,9 @@ export default class WereadNoteSyncPlugin extends Plugin {
     /** 同步进行中标记（防重入）。 */
     #syncing = false;
 
+    /** PR#13 评审修复：在途同步/决策写入的泄流句柄（onunload 释放租约前必须先等它落定）。 */
+    #activeWrite: Promise<unknown> | null = null;
+
     onload(): void {
         this.#text = createSettingsText(this.i18n);
         const text = this.#text;
@@ -81,11 +84,18 @@ export default class WereadNoteSyncPlugin extends Plugin {
     }
 
     onunload(): void {
-        // T06：停用即释放写入端租约（他端可立即接管，不等 30 分钟）
-        const engine = this.#buildEngine();
-        if (engine !== null) {
-            void engine.releaseWriter();
-        }
+        // T06 + PR#13 评审修复：先泄流在途同步写入、再释放写入端租约——
+        // 否则他端立即接管后，本轮仍在继续写内核并会把旧租约写回 index，覆盖新端的认领
+        void (async () => {
+            const active = this.#activeWrite;
+            if (active !== null) {
+                await active.catch(() => undefined);
+            }
+            const engine = this.#buildEngine();
+            if (engine !== null) {
+                await engine.releaseWriter().catch(() => undefined);
+            }
+        })();
         // 仅清会话内存；用户勾选“记住”时 localStorage 保留（策略见 api-key-store.ts）
         this.#apiKeyStore.dispose();
         if (this.#settingsApp !== null) {
@@ -250,6 +260,18 @@ export default class WereadNoteSyncPlugin extends Plugin {
         if (text === null || this.#syncing) {
             return;
         }
+        // PR#9 评审修复：守卫必须先于第一个 await——noteApiKey 的 SHA-256 是异步的，
+        // 守卫晚于它会让两次快速触发并发进入，双引擎并发写同一持久化与内核
+        this.#syncing = true;
+        const run = this.#syncNowInner(text).finally(() => {
+            this.#activeWrite = null;
+            this.#syncing = false;
+        });
+        this.#activeWrite = run;
+        await run;
+    }
+
+    async #syncNowInner(text: SettingsText): Promise<void> {
         const apiKey = this.#apiKeyStore.key;
         const namespace = this.#accountStore.namespace;
         if (!isValidWereadApiKey(apiKey)) {
@@ -274,7 +296,6 @@ export default class WereadNoteSyncPlugin extends Plugin {
             showMessage(`⚠️ ${text.syncKeyChangedWarning}`, 6000, "info");
         }
 
-        this.#syncing = true;
         showMessage(text.syncRunning, 2000, "info");
         try {
             const engine = this.#buildEngine();
@@ -338,8 +359,6 @@ export default class WereadNoteSyncPlugin extends Plugin {
             }
             // 其余异常文本可能含上下文：仅展示通用提示（脱敏在 core 层，此处不透出原始消息）
             showMessage(text.syncUnexpectedError, 5000, "error");
-        } finally {
-            this.#syncing = false;
         }
     }
 

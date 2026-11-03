@@ -28,6 +28,9 @@ export interface ItemState {
     pendingRemote?: PendingRemote;
     /** T03：进行中的受控更新意图（设计契约 §3） */
     pendingUpdate?: PendingUpdate;
+    /** 更新隔离时的完整恢复快照（PR#10 评审修复）：before/after 全文持久保留，
+     * 供用户找回被覆盖后验证失败的本地编辑；不随世代轮换清除。 */
+    recovery?: { before: string; after: string; reason: string; quarantinedAt: string };
 }
 
 export interface PendingOp {
@@ -35,6 +38,10 @@ export interface PendingOp {
     sourceKey: string;
     payloadText: string;
     startedAt: string;
+    /** 原始来源载荷与指纹（PR#9 评审修复：收养时还原基线，避免"adopted"指纹
+     * 让已核对条目在后续轮永续误判 source-changed）。旧状态无此字段，收养时回退。 */
+    payload?: Record<string, unknown>;
+    fingerprint?: string;
 }
 
 /** T03：待审来源变更（同步轮发现指纹变化即写入；决策后清除） */

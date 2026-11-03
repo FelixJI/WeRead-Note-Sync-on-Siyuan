@@ -43,6 +43,8 @@ export interface BookScript {
     reviews: RawReview[];
     /** 模拟 bookmarklist 回包异常（updated 非数组 → complete=false） */
     bookmarkListBroken?: boolean;
+    /** PR9-15 测试钩子：bookmarklist 回 upgrade_info → UpgradeRequiredError 整轮中止 */
+    bookmarkListUpgrade?: boolean;
 }
 
 export class FakeTransport implements Transport {
@@ -75,6 +77,13 @@ export class FakeTransport implements Transport {
         if (api === "/book/bookmarklist") {
             const bookId = String(req.bookId);
             const b = this.books[bookId];
+            if (b?.bookmarkListUpgrade === true) {
+                return {
+                    status: 200,
+                    contentType: "application/json",
+                    body: JSON.stringify({ errcode: 0, upgrade_info: { message: "客户端版本过低，请升级后重试" } }),
+                };
+            }
             if (b === undefined || b.bookmarkListBroken) {
                 return { status: 200, body: JSON.stringify({ errcode: 0, updated: null }), contentType: "application/json" };
             }
@@ -88,6 +97,14 @@ export class FakeTransport implements Transport {
                     chapters: chapterUids.map((uid) => ({ chapterUid: uid, chapterIdx: uid, title: `第${uid}章` })),
                     book: { title: b.title },
                 }),
+            };
+        }
+        if (api === "/readdata/detail") {
+            // 良性应答：避免投影开启的引擎测试触发统计"四败冷却"（模块级状态会泄漏进其它测试文件）
+            return {
+                status: 200,
+                contentType: "application/json",
+                body: JSON.stringify({ errcode: 0, mode: req.mode, totalReadTime: 0, readDays: 0 }),
             };
         }
         if (api === "/review/list/mine") {
@@ -131,6 +148,8 @@ export class FakeKernel {
     /** 命中时执行变更但返回错误（模拟响应丢失）：按 API 的第 N 次调用（1 起） */
     dropAt = new Map<string, Set<number>>();
     #callCounts = new Map<string, number>();
+    /** PR9-9 测试钩子：记录全部内核调用（断言 insertBlock 的锚点） */
+    calls: Array<{ path: string; data: unknown }> = [];
 
     #id(prefix: string): string {
         this.#seq += 1;
@@ -195,6 +214,7 @@ export class FakeKernel {
     }
 
     call: KernelCallFn = async (path: string, data: unknown): Promise<unknown> => {
+        this.calls.push({ path, data });
         const fault = this.#takeFault(path);
         const failResp = { code: -1, msg: `注入故障 ${path}` };
         if (fault === "fail") {
@@ -474,7 +494,7 @@ export class MemoryPersistence implements StatePersistence {
 
 // ---------- 工具 ----------
 
-function makeDeps(books: Record<string, BookScript>) {
+function makeDeps(books: Record<string, BookScript>, opts?: { projectOverview?: boolean }) {
     const transport = new FakeTransport(books);
     const kernel = new FakeKernel();
     const persistence = new MemoryPersistence();
@@ -487,7 +507,7 @@ function makeDeps(books: Record<string, BookScript>) {
         accountNamespace: NS,
         now: () => "2026-11-03T00:00:00Z",
         newOpId: () => `op-${String((seq += 1)).padStart(4, "0")}`,
-        projectOverview: false,
+        projectOverview: opts?.projectOverview ?? false,
     });
     return { transport, kernel, persistence, engine };
 }
@@ -530,10 +550,10 @@ describe("同步引擎：非破坏导入与稳定块映射", () => {
         for (const b of kernel.itemBlocks()) {
             expect(b.id).toBe(idsAfter1.get(b.ial["custom-wrs-src"]));
         }
-        // 文档唯一
+        // 文档唯一（PR9-3：标题并入 bookId）
         const docs = kernel.allBlocks().filter((b) => b.type === "d");
         expect(docs.length).toBe(1);
-        expect(docs[0]?.content).toBe("三体");
+        expect(docs[0]?.content).toBe("三体 (10001)");
         // 挂靠 review 是对应 highlight 的子块；独立 review 在文档直接子级
         const h1 = kernel.itemBlocks().find((b) => b.ial["custom-wrs-src"] === srcOf("10001", "highlight", "h1"));
         const r1Block = kernel.itemBlocks().find((b) => b.ial["custom-wrs-src"] === srcOf("10001", "review", "r1"));
@@ -542,7 +562,7 @@ describe("同步引擎：非破坏导入与稳定块映射", () => {
         expect(r2Block?.parentId).toBe(docs[0]?.id);
     });
 
-    it("AC1：同名书按 bookId 区分为两份文档", async () => {
+    it("AC1：同名书按 bookId 区分为两份文档（PR9-3：路径含 bookId 不共享）", async () => {
         const books = fixture();
         books["10002"] = { ...books["10001"]!, title: "三体", highlights: [books["10001"]!.highlights[0]!], reviews: [] };
         const { kernel, engine } = makeDeps(books);
@@ -550,6 +570,11 @@ describe("同步引擎：非破坏导入与稳定块映射", () => {
         expect(r.ok).toBe(true);
         const docs = kernel.allBlocks().filter((b) => b.type === "d");
         expect(docs.length).toBe(2);
+        // 两份文档标题/路径不同——绝不共享同一路径（真实内核同 path 会返回既有文档并静默改绑）
+        const titles = docs.map((d) => d.content).sort();
+        expect(titles).toEqual(["三体 (10001)", "三体 (10002)"]);
+        expect(docs.find((d) => d.ial["custom-wrs-book-id"] === "10001")).toBeDefined();
+        expect(docs.find((d) => d.ial["custom-wrs-book-id"] === "10002")).toBeDefined();
         expect(kernel.itemBlocks().length).toBe(6); // 10001: 3划线+2想法；10002: 1划线
     });
 
@@ -622,9 +647,10 @@ describe("同步引擎：非破坏导入与稳定块映射", () => {
     it("AC3-切断2：写入成功但响应丢失 → 按 IAL 认领，不重复创建", async () => {
         const books = fixture();
         const { kernel, engine } = makeDeps(books);
-        // appendBlock 调用序（首轮）：1=摘录标题、2=第1章标题、3=h1 条目块
-        // 第 3 次丢弃响应：块已创建（出生带 IAL）但引擎收到错误
-        kernel.dropAt.set("/api/block/appendBlock", new Set([3]));
+        // PR9-9 修复后首轮调用序：appendBlock 1=摘录标题、2=第1章标题，
+        // 随后 h1 条目块经 insertBlock（锚在第1章标题后）——第 1 次 insertBlock 丢弃响应：
+        // 块已创建（出生带 IAL）但引擎收到错误
+        kernel.dropAt.set("/api/block/insertBlock", new Set([1]));
         const r1 = await engine.syncRound();
         expect(r1.ok).toBe(false); // h1 create 报错中断本书
         // h1 块已实际存在（带 IAL）
@@ -932,8 +958,8 @@ describe("同步引擎：非破坏导入与稳定块映射", () => {
             }
         }
         kernel.blocks.delete(doc.id);
-        // 用户在插件笔记本里自建同名文档（有内容）
-        await kernel.call("/api/filetree/createDocWithMd", { notebook: kernel.notebooks[0]!.id, path: "/三体", markdown: "" });
+        // 用户在插件笔记本里自建同名文档（有内容；PR9-3 后引擎目标标题为 "三体 (10001)"）
+        await kernel.call("/api/filetree/createDocWithMd", { notebook: kernel.notebooks[0]!.id, path: "/三体 (10001)", markdown: "" });
         const userDoc = kernel.allBlocks().find((b) => b.type === "d")!;
         await kernel.call("/api/block/appendBlock", { dataType: "markdown", data: "用户自己的内容", parentID: userDoc.id });
 
@@ -1029,5 +1055,247 @@ describe("同步引擎：非破坏导入与稳定块映射", () => {
         expect(kernel.allBlocks().filter((b) => b.type === "d").length).toBe(1);
         // 条目重新导入（状态已重建为空）
         expect(kernel.itemBlocks().length).toBe(5);
+    });
+});
+
+// ---------- PR#8-#13 评审意见修复回归 ----------
+
+describe("同步引擎：PR 评审意见修复", () => {
+    it("PR9-7：pendingOp 的 oplog 条目未持久化 → 下轮容忍缺失并恢复，不永久卡死", async () => {
+        const books = fixture();
+        const { kernel, persistence, engine } = makeDeps(books);
+        await engine.syncRound();
+        // 模拟崩溃窗口：store.save(pending) 已落盘、oplog.append 前进程中断（日志无该 opId）
+        books["10001"]!.highlights.push({
+            bookmarkId: "h4", chapterUid: 1, markText: "崩溃窗口新增", range: "50-60", createTime: 1700000004,
+        });
+        const st = persistence.store.get("book-10001") as {
+            pendingOp?: { opId: string; sourceKey: string; payloadText: string; startedAt: string };
+        };
+        st.pendingOp = {
+            opId: "op-ghost-9999",
+            sourceKey: srcOf("10001", "highlight", "h4"),
+            payloadText: "> 崩溃窗口新增",
+            startedAt: "2026-11-03T00:00:00Z",
+        };
+        persistence.store.set("book-10001", st);
+
+        const r2 = await engine.syncRound();
+        expect(r2.ok).toBe(true);
+        expect(r2.books[0]?.created).toBe(1);
+        // 块恰好一块（恢复后由 plan 正常创建，不重复）
+        expect(kernel.itemBlocks().filter((b) => b.ial["custom-wrs-src"] === srcOf("10001", "highlight", "h4")).length).toBe(1);
+    });
+
+    it("PR9-9：既有章节的新增划线插入该章节内部，不落文档末尾；同轮保持顺序", async () => {
+        const books = fixture();
+        const { kernel, engine } = makeDeps(books);
+        await engine.syncRound();
+        const doc = kernel.allBlocks().find((b) => b.type === "d")!;
+        const ch1Heading = kernel.allBlocks().find((b) => b.type === "h" && b.content === "第1章")!;
+        expect(ch1Heading).toBeDefined();
+        kernel.calls.length = 0;
+        books["10001"]!.highlights.push(
+            { bookmarkId: "h4", chapterUid: 1, markText: "增量一", range: "50-60", createTime: 1700000004 },
+            { bookmarkId: "h5", chapterUid: 1, markText: "增量二", range: "70-80", createTime: 1700000005 },
+        );
+        const r2 = await engine.syncRound();
+        expect(r2.ok).toBe(true);
+        expect(r2.books[0]?.created).toBe(2);
+        const h4 = kernel.itemBlocks().find((b) => b.ial["custom-wrs-src"] === srcOf("10001", "highlight", "h4"))!;
+        const h5 = kernel.itemBlocks().find((b) => b.ial["custom-wrs-src"] === srcOf("10001", "highlight", "h5"))!;
+        const h2 = kernel.itemBlocks().find((b) => b.ial["custom-wrs-src"] === srcOf("10001", "highlight", "h2"))!;
+        // h4 锚定在第1章内最后一条既有划线（h2）之后——章节内部而非文档末尾
+        const insertH4 = kernel.calls.find((c) => c.path === "/api/block/insertBlock" && String((c.data as Record<string, unknown>).data ?? "").includes("增量一"));
+        expect(String((insertH4?.data as Record<string, unknown>).previousID)).toBe(h2.id);
+        // h5 链式插在 h4 之后（同轮顺序保持）
+        const insertH5 = kernel.calls.find((c) => c.path === "/api/block/insertBlock" && String((c.data as Record<string, unknown>).data ?? "").includes("增量二"));
+        expect(String((insertH5?.data as Record<string, unknown>).previousID)).toBe(h4.id);
+        // 均在管理文档内
+        expect(h4.rootId).toBe(doc.id);
+        expect(h5.rootId).toBe(doc.id);
+    });
+
+    it("PR9-4：挂靠父块被移出管理范围后，新想法改独立渲染，不写入用户其它文档", async () => {
+        const books = fixture();
+        const { kernel, engine } = makeDeps(books);
+        await engine.syncRound();
+        const doc = kernel.allBlocks().find((b) => b.type === "d")!;
+        const otherDoc: FakeBlock = {
+            id: "doc-other", type: "d", content: "别的文档", markdown: "",
+            ial: { id: "doc-other" }, parentId: null, rootId: "doc-other", box: kernel.notebooks[0]?.id, children: [],
+        };
+        kernel.blocks.set("doc-other", otherDoc);
+        const h1 = kernel.itemBlocks().find((b) => b.ial["custom-wrs-src"] === srcOf("10001", "highlight", "h1"))!;
+        h1.parentId = "doc-other";
+        h1.rootId = "doc-other";
+        otherDoc.children.push(h1.id);
+        // 新增与 h1 精确匹配的想法（chapterUid+range 命中 → 原本会挂靠已移出的 h1）
+        books["10001"]!.reviews.push({
+            review: { reviewId: "r3", content: "对已移出划线的想法", range: "10-20", chapterUid: 1, createTime: 1700000012 },
+        });
+        const r2 = await engine.syncRound();
+        expect(r2.ok).toBe(true);
+        const r3 = kernel.itemBlocks().find((b) => b.ial["custom-wrs-src"] === srcOf("10001", "review", "r3"))!;
+        expect(r3).toBeDefined();
+        // 独立渲染：挂在管理文档下，绝不进入用户移入的其它文档
+        expect(r3.rootId).toBe(doc.id);
+        expect(r3.parentId).not.toBe(h1.id);
+    });
+
+    it("PR9-15：详情接口返回 upgrade_info → 整轮立即中止并透出升级指引", async () => {
+        const books = fixture();
+        books["10002"] = {
+            title: "第二本书",
+            highlights: [{ bookmarkId: "x1", chapterUid: 1, markText: "内容", range: "1-2", createTime: 1700000009 }],
+            reviews: [],
+        };
+        books["10001"]!.bookmarkListUpgrade = true;
+        const { engine } = makeDeps(books);
+        const r = await engine.syncRound();
+        expect(r.ok).toBe(false);
+        expect(r.abortedReason ?? "").toContain("升级");
+        expect(r.abortedReason ?? "").toContain("客户端版本过低");
+        // 未产出任何书结果（整轮中止，未继续后续书）
+        expect(r.books).toHaveLength(0);
+    });
+
+    it("PR10-8：远端文本尾随空白不再误判为更新失败（同口径归一化比较）", async () => {
+        const books = fixture();
+        const { engine } = makeDeps(books);
+        await engine.syncRound();
+        books["10001"]!.highlights[0]!.markText = "给岁月以文明  ";
+        const r2 = await engine.syncRound();
+        expect(r2.candidatesReport).toHaveLength(1);
+        const queue = await engine.buildReviewQueue();
+        expect(queue).toHaveLength(1);
+        const item = queue[0]!;
+        const res = await engine.applyDecision(item.sourceKey, "apply-remote", undefined, item.local, item.remoteFingerprint);
+        expect(res.ok).toBe(true);
+        // 下一轮不再产生候选（基线已按远端指纹推进）
+        const r3 = await engine.syncRound();
+        expect(r3.candidatesReport).toHaveLength(0);
+    });
+
+    it("PR10-3：更新隔离时持久保留完整 before/after 恢复快照", async () => {
+        const books = fixture();
+        const { kernel, persistence, engine } = makeDeps(books);
+        await engine.syncRound();
+        books["10001"]!.highlights[0]!.markText = "被覆盖后的新文本";
+        await engine.syncRound();
+        const queue = await engine.buildReviewQueue();
+        const item = queue[0]!;
+        kernel.dropIdentityOnUpdate = true;
+        const res = await engine.applyDecision(item.sourceKey, "apply-remote", undefined, item.local, item.remoteFingerprint);
+        expect(res.ok).toBe(false);
+        const st = persistence.store.get("book-10001") as {
+            items: Record<string, { status: string; recovery?: { before: string; after: string; reason: string } }>;
+        };
+        const rec = st.items[item.sourceKey]?.recovery;
+        expect(rec).toBeDefined();
+        expect(rec!.before).toContain("给岁月以文明");
+        expect(rec!.after).toContain("被覆盖后的新文本");
+        expect(rec!.reason.length).toBeGreaterThan(0);
+    });
+
+    it("PR10-6：同书并发决策串行化，两个决策都生效不互相覆盖", async () => {
+        const books = fixture();
+        const { persistence, engine } = makeDeps(books);
+        await engine.syncRound();
+        books["10001"]!.highlights[0]!.markText = "并发修改一";
+        books["10001"]!.highlights[1]!.markText = "并发修改二";
+        await engine.syncRound();
+        const queue = await engine.buildReviewQueue();
+        expect(queue).toHaveLength(2);
+        const [a, b] = await Promise.all([
+            engine.applyDecision(queue[0]!.sourceKey, "keep-local", undefined, queue[0]!.local, queue[0]!.remoteFingerprint),
+            engine.applyDecision(queue[1]!.sourceKey, "keep-local", undefined, queue[1]!.local, queue[1]!.remoteFingerprint),
+        ]);
+        expect(a.ok).toBe(true);
+        expect(b.ok).toBe(true);
+        const st = persistence.store.get("book-10001") as {
+            items: Record<string, { pendingRemote?: unknown; override?: boolean }>;
+        };
+        for (const q of queue) {
+            expect(st.items[q.sourceKey]?.pendingRemote).toBeUndefined();
+            expect(st.items[q.sourceKey]?.override).toBe(true);
+        }
+    });
+
+    it("PR10-7：副本写入成功但回读失败 → 重试收养已落地副本，不重复建副本", async () => {
+        const books = fixture();
+        const { kernel, engine } = makeDeps(books);
+        await engine.syncRound();
+        books["10001"]!.highlights[0]!.markText = "副本场景新文本";
+        await engine.syncRound();
+        const queue = await engine.buildReviewQueue();
+        const item = queue[0]!;
+        // 第一次 save-copy：写入成功但验证回读失败
+        kernel.failReadAt.add(kernel.readCount + 1);
+        const first = await engine.applyDecision(item.sourceKey, "save-copy", undefined, item.local, item.remoteFingerprint);
+        expect(first.ok).toBe(false);
+        const copiesAfterFirst = kernel.allBlocks().filter((b) => b.ial["custom-wrs-copy-of"] === item.sourceKey);
+        expect(copiesAfterFirst).toHaveLength(1);
+        // 重试：收养已落地副本，不再创建第二份
+        const retry = await engine.applyDecision(item.sourceKey, "save-copy", undefined, item.local, item.remoteFingerprint);
+        expect(retry.ok).toBe(true);
+        const copiesAfterRetry = kernel.allBlocks().filter((b) => b.ial["custom-wrs-copy-of"] === item.sourceKey);
+        expect(copiesAfterRetry).toHaveLength(1);
+    });
+
+    it("PR13-4：无主/过期租约时决策先认领再写；本端决策续约 lastSeenAt", async () => {
+        const books = fixture();
+        const { persistence, engine } = makeDeps(books);
+        await engine.syncRound();
+        books["10001"]!.highlights[0]!.markText = "认领场景";
+        await engine.syncRound();
+        const queue = await engine.buildReviewQueue();
+        const item = queue[0]!;
+        // 置为过期他端租约（>30 分钟无活动）
+        const idx = persistence.store.get("index") as {
+            writer?: { writerId: string; label: string; claimedAt: number; lastSeenAt: number };
+        };
+        const stale = Date.parse("2026-11-03T00:00:00Z") - 40 * 60 * 1000;
+        idx.writer = { writerId: "w-other-end", label: "他端", claimedAt: stale, lastSeenAt: stale };
+        persistence.store.set("index", idx);
+        const res = await engine.applyDecision(item.sourceKey, "keep-local", undefined, item.local, item.remoteFingerprint);
+        expect(res.ok).toBe(true);
+        const after = persistence.store.get("index") as {
+            writer?: { writerId: string; lastSeenAt: number };
+        };
+        // 决策写入认领了租约（不再是无主裸写）
+        expect(after.writer).toBeDefined();
+        expect(after.writer!.writerId).not.toBe("w-other-end");
+        expect(after.writer!.lastSeenAt).toBe(Date.parse("2026-11-03T00:00:00Z"));
+    });
+
+    it("PR12-6：index 账号命名空间与引擎不符 → listBookSummaries 拒绝返回缓存书目", async () => {
+        const books = fixture();
+        const { persistence, engine } = makeDeps(books);
+        await engine.syncRound();
+        const summariesBefore = await engine.listBookSummaries(10);
+        expect(summariesBefore).toHaveLength(1);
+        const idx = persistence.store.get("index") as { accountNamespace: string };
+        idx.accountNamespace = "另一个账号";
+        persistence.store.set("index", idx);
+        const summariesAfter = await engine.listBookSummaries(10);
+        expect(summariesAfter).toHaveLength(0);
+    });
+
+    it("PR11-5：书目清空后仍投影，残留条目获得“来源未返回”标记", async () => {
+        const books = fixture();
+        const { transport, kernel, engine } = makeDeps(books, { projectOverview: true });
+        const r1 = await engine.syncRound();
+        expect(r1.ok).toBe(true);
+        expect(kernel.allBlocks().some((b) => b.ial["custom-wrs-overview"] === "1")).toBe(true);
+        for (const key of Object.keys(transport.books)) {
+            delete transport.books[key];
+        }
+        const r2 = await engine.syncRound();
+        expect(r2.ok).toBe(true);
+        expect(r2.protectionMode).toBeUndefined();
+        // 最后一本书从书目消失：总览条目被标记“来源未返回”，而非继续显示为最新
+        const marked = kernel.allBlocks().filter((b) => (b.markdown ?? "").includes("来源未返回") || (b.content ?? "").includes("来源未返回"));
+        expect(marked.length).toBeGreaterThan(0);
     });
 });

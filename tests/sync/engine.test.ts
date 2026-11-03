@@ -15,7 +15,7 @@ const NS = "测试账号";
 
 // ---------- FakeTransport ----------
 
-interface RawHighlight {
+export interface RawHighlight {
     bookmarkId: string;
     chapterUid: number;
     markText: string;
@@ -24,7 +24,7 @@ interface RawHighlight {
     type?: number;
 }
 
-interface RawReview {
+export interface RawReview {
     review: {
         reviewId: string;
         content: string;
@@ -37,7 +37,7 @@ interface RawReview {
     abstract?: string;
 }
 
-interface BookScript {
+export interface BookScript {
     title: string;
     highlights: RawHighlight[];
     reviews: RawReview[];
@@ -45,7 +45,7 @@ interface BookScript {
     bookmarkListBroken?: boolean;
 }
 
-class FakeTransport implements Transport {
+export class FakeTransport implements Transport {
     constructor(public books: Record<string, BookScript>) {}
 
     async post(_url: string, body: unknown): Promise<{ status: number; body: string; contentType?: string }> {
@@ -106,7 +106,7 @@ class FakeTransport implements Transport {
 
 // ---------- FakeKernel ----------
 
-interface FakeBlock {
+export interface FakeBlock {
     id: string;
     type: string; // d / h / 其他
     content: string;
@@ -118,11 +118,16 @@ interface FakeBlock {
     children: string[];
 }
 
-class FakeKernel {
+export class FakeKernel {
     blocks = new Map<string, FakeBlock>();
     notebooks: Array<{ id: string; name: string; closed: boolean }> = [];
     #seq = 0;
     failNext = new Set<string>();
+    /** T03 测试钩子：updateBlock 后丢弃 custom-wrs-src（模拟身份属性丢失） */
+    dropIdentityOnUpdate = false;
+    /** T03 测试钩子：第 N 次（1 起）getBlockKramdown 返回失败（模拟验证回读失败） */
+    failReadAt = new Set<number>();
+    readCount = 0;
     /** 命中时执行变更但返回错误（模拟响应丢失）：按 API 的第 N 次调用（1 起） */
     dropAt = new Map<string, Set<number>>();
     #callCounts = new Map<string, number>();
@@ -263,6 +268,34 @@ class FakeKernel {
                     data: [{ doOperations: [{ action: "insert", id: block.id }] }],
                 };
             }
+            case "/api/block/updateBlock": {
+                // T03 受控原位更新：解析 markdown（含 IAL），更新正文与属性；
+                // dropIdentityOnUpdate=true 时丢弃 custom-wrs-src（模拟属性丢失）
+                const block = this.blocks.get(String(rec.id));
+                if (block === undefined) {
+                    return { code: -1, msg: "块不存在" };
+                }
+                const { body, attrs } = FakeKernel.parseMarkdown(String(rec.data));
+                if (fault === "drop") {
+                    // 执行变更但响应丢失
+                    block.markdown = body;
+                    block.content = body.replace(/^(> |- 💭 |[-*+] |#{1,6} )/u, "");
+                    if (!this.dropIdentityOnUpdate) {
+                        Object.assign(block.ial, attrs);
+                    } else {
+                        block.ial = { id: block.id };
+                    }
+                    return failResp;
+                }
+                block.markdown = body;
+                block.content = body.replace(/^(> |- 💭 |[-*+] |[-*+] |#{1,6} )/u, "");
+                if (!this.dropIdentityOnUpdate) {
+                    Object.assign(block.ial, attrs);
+                } else {
+                    block.ial = { id: block.id };
+                }
+                return { code: 0, msg: "", data: [{ doOperations: [{ action: "update", id: block.id }] }] };
+            }
             case "/api/attr/setBlockAttrs": {
                 const block = this.blocks.get(String(rec.id));
                 if (block === undefined) {
@@ -272,6 +305,10 @@ class FakeKernel {
                 return { code: 0, msg: "", data: null };
             }
             case "/api/block/getBlockKramdown": {
+                this.readCount += 1;
+                if (this.failReadAt.delete(this.readCount)) {
+                    return { code: -1, msg: "注入：回读失败" };
+                }
                 const block = this.blocks.get(String(rec.id));
                 if (block === undefined) {
                     return { code: -1, msg: "块不存在" };
@@ -414,7 +451,7 @@ class FakeKernel {
 
 // ---------- MemoryPersistence ----------
 
-class MemoryPersistence implements StatePersistence {
+export class MemoryPersistence implements StatePersistence {
     store = new Map<string, unknown>();
     failNextSave = new Set<string>();
 
@@ -454,7 +491,7 @@ function makeDeps(books: Record<string, BookScript>) {
     return { transport, kernel, persistence, engine };
 }
 
-function fixture(): Record<string, BookScript> {
+export function fixture(): Record<string, BookScript> {
     return {
         "10001": {
             title: "三体",
@@ -604,15 +641,15 @@ describe("同步引擎：非破坏导入与稳定块映射", () => {
     it("AC3-切断3：块创建+记账前持久化失败 → 下一轮收养不重复", async () => {
         const books = fixture();
         const { kernel, persistence, engine } = makeDeps(books);
-        // 记账链路的 bookName 保存序：1=重建init、2/3=ensureDoc(prev+cur)、4/5=意图(prev+cur)、6/7=记账(prev+cur)
-        // 拦截第 6 次（记账世代写入）→ 落块成功但账未记
+        // 记账链路的 bookName 保存序（仅计 <name> 本身、不含 .prev；T03 整改 M5 后实测）：
+        // 1=重建init、2=候选提前落盘、3=ensureDoc、4=h1 意图、5=h1 记账 ←拦截此点（落块成功但账未记）
         const bookName = "book-10001";
         let bookSaves = 0;
         const origSave = persistence.save.bind(persistence);
         persistence.save = async (name: string, content: unknown) => {
             if (name === bookName) {
                 bookSaves += 1;
-                if (bookSaves === 6) {
+                if (bookSaves === 5) {
                     throw new Error("注入：记账保存失败");
                 }
             }

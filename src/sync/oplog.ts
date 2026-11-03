@@ -4,10 +4,21 @@
 export interface OpLogEntry {
     opId: string;
     ts: string;
-    intent: "create-notebook" | "create-doc" | "create-block" | "set-attrs" | "adopt" | "quarantine";
+    intent:
+        | "create-notebook"
+        | "create-doc"
+        | "create-block"
+        | "set-attrs"
+        | "adopt"
+        | "quarantine"
+        | "update-block"
+        | "decision";
     sourceKey?: string;
     blockId?: string;
     payloadText?: string;
+    /** T03：update-block 完整 before/after 快照（审计用，不截断） */
+    beforeText?: string;
+    afterText?: string;
     status: "pending" | "done" | "failed";
     error?: string;
 }

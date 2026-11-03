@@ -11,7 +11,7 @@
  *
  * 安全约束：不输出任何日志；API Key 不进入 console/日志/诊断内容。
  */
-import { Plugin, Setting, showMessage, Menu } from "siyuan";
+import { Plugin, Setting, showMessage, Menu, Dialog } from "siyuan";
 import { mount, unmount } from "svelte";
 import SettingsPage from "./settings/settings-page.svelte";
 import { ApiKeyStore } from "./settings/api-key-store";
@@ -21,6 +21,8 @@ import { createKernelForwardProxyTransport } from "./core/net/forward-proxy-tran
 import { kernelForwardProxy } from "./adapters/siyuan/kernel";
 import { isValidWereadApiKey } from "./adapters/weread/client";
 import { SyncEngine, AccountMismatchError } from "./sync/engine";
+import { initReviewSession } from "./review/queue";
+import { mountReviewDialog } from "./review/ui/review-dialog";
 import { createPluginPersistence, kernelCall } from "./sync/runtime";
 import { validateSourceSegment } from "./sync/identity";
 import "./index.scss";
@@ -66,6 +68,13 @@ export default class WereadNoteSyncPlugin extends Plugin {
             callback: () => void this.#syncNow(),
         });
 
+        this.addCommand({
+            langKey: "commandReviewChanges",
+            langText: text.commandReviewChanges,
+            hotkey: "",
+            callback: () => this.#openReviewDialog(),
+        });
+
         this.#setupSetting();
     }
 
@@ -100,6 +109,11 @@ export default class WereadNoteSyncPlugin extends Plugin {
             label: text.commandSyncNow,
             click: () => void this.#syncNow(),
         });
+        menu.addItem({
+            icon: "iconDiff",
+            label: text.commandReviewChanges,
+            click: () => this.#openReviewDialog(),
+        });
         menu.addSeparator();
         menu.addItem({
             icon: "iconSettings",
@@ -107,6 +121,47 @@ export default class WereadNoteSyncPlugin extends Plugin {
             click: () => this.openSetting(),
         });
         menu.open({ x: event.clientX, y: event.clientY });
+    }
+
+    #openReviewDialog(): void {
+        const text = this.#text;
+        if (text === null) {
+            return;
+        }
+        const engine = this.#buildEngine();
+        if (engine === null) {
+            this.openSetting();
+            return;
+        }
+        initReviewSession({ engine });
+        const host = document.createElement("div");
+        const dialog = new Dialog({
+            title: text.reviewDialogTitle,
+            content: "",
+            width: "860px",
+            height: "70%",
+        });
+        const unmounted = mountReviewDialog(host, {
+            onClose: () => dialog.destroy(),
+            i18n: text,
+        });
+        dialog.element.querySelector(".b3-dialog__content")?.appendChild(host);
+        void unmounted;
+    }
+
+    #buildEngine(): SyncEngine | null {
+        const apiKey = this.#apiKeyStore.key;
+        const namespace = this.#accountStore.namespace;
+        if (!isValidWereadApiKey(apiKey) || namespace.length === 0) {
+            return null;
+        }
+        return new SyncEngine({
+            persistence: createPluginPersistence(this),
+            kernel: kernelCall,
+            transport: createKernelForwardProxyTransport(kernelForwardProxy),
+            apiKey,
+            accountNamespace: namespace,
+        });
     }
 
     async #syncNow(): Promise<void> {
@@ -141,13 +196,12 @@ export default class WereadNoteSyncPlugin extends Plugin {
         this.#syncing = true;
         showMessage(text.syncRunning, 2000, "info");
         try {
-            const engine = new SyncEngine({
-                persistence: createPluginPersistence(this),
-                kernel: kernelCall,
-                transport: createKernelForwardProxyTransport(kernelForwardProxy),
-                apiKey,
-                accountNamespace: namespace,
-            });
+            const engine = this.#buildEngine();
+            if (engine === null) {
+                showMessage(text.syncUnexpectedError, 5000, "error");
+                return;
+            }
+            initReviewSession({ engine });
             const outcome = await engine.syncRound();
             if (outcome.protectionMode !== undefined) {
                 showMessage(`${text.syncDoneWithError}${outcome.protectionMode}`, 7000, "error");

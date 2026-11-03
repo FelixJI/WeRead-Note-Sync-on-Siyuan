@@ -30,11 +30,14 @@ import {
     renderChapterHeading,
     renderReviewSectionHeading,
     renderHighlightsSectionHeading,
+    renderHighlightBlock,
+    renderReviewChild,
     sanitizeDocTitle,
 } from "./kramdown";
 import { computePlan, type SyncPlan } from "./plan";
 import { OpLog, type OpLogEntry } from "./oplog";
-import { makeSourceKey, type SourceKind } from "./identity";
+import { makeSourceKey, parseSourceKey, type SourceKind } from "./identity";
+import { classifyConflict, renderManualMerge } from "../review/model";
 
 export interface SyncEngineDeps {
     persistence: StatePersistence;
@@ -74,6 +77,26 @@ export interface RoundOutcome {
     candidatesReport: Array<{ bookId: string; sourceKey: string; reason: string }>;
     protectedReport: Array<{ bookId: string; sourceKey: string; reason: string }>;
 }
+
+// ---------- T03：审阅队列与受控决策（设计契约 §2/§3） ----------
+
+export interface ReviewCandidate {
+    bookId: string;
+    bookTitle: string;
+    sourceKey: string;
+    kind: SourceKind;
+    blockId: string;
+    baseline: string;
+    local: string;
+    remote: string;
+    remoteFingerprint: string;
+    conflict: "identical" | "remote-only" | "local-only" | "both-changed";
+    detectedAt: string;
+}
+
+export type ApplyResult =
+    | { ok: true }
+    | { ok: false; kind: "stale" | "missing" | "kernel" | "not-found"; message: string };
 
 /** 账号标识与既有状态不一致（换账号须显式处理，绝不自动混入）。 */
 export class AccountMismatchError extends Error {
@@ -410,6 +433,11 @@ export class SyncEngine {
         outcome.adopted += recovery.adopted;
         outcome.quarantined += recovery.quarantined;
 
+        // ---- T03 恢复：pendingUpdate 核对（§3 重入：after→收养 / before→重议 / 其他→隔离）----
+        const updRecovery = await this.#reconcilePendingUpdates(store, state);
+        state = updRecovery.state;
+        outcome.quarantined += updRecovery.quarantined;
+
         // ---- 块体检：存在性 / moved-out / 本地漂移 / 属性歧义（AC2/AC4/AC5）----
         const audit = await this.#auditBlocks(store, state, bookId);
         state = audit.state;
@@ -441,6 +469,35 @@ export class SyncEngine {
             round,
             accountNamespace: this.#deps.accountNamespace,
         });
+        // 审阅整改：拉取异常整书跳过时零状态变更（含候选清除——异常轮不得动既有 pendingRemote）
+        if (!plan.skipped) {
+            // T03：候选持久化为 pendingRemote（UI 审阅队列数据源）；本轮未再变化的条目清除旧候选
+            const candidateKeys = new Set(plan.candidates.map((c) => c.sourceKey));
+            const payloadByKey = new Map<string, { payload: Record<string, unknown>; rendered: string }>();
+            for (const h of detail.highlights) {
+                payloadByKey.set(this.#sourceKey(bookId, "highlight", h.bookmarkId), { payload: h.raw, rendered: renderHighlightBlock(h.markText) });
+            }
+            for (const r of detail.reviews) {
+                payloadByKey.set(this.#sourceKey(bookId, "review", r.reviewId), { payload: r.raw, rendered: renderReviewChild(r.content) });
+            }
+            for (const c of plan.candidates) {
+                const src = payloadByKey.get(c.sourceKey);
+                const item = state.items[c.sourceKey];
+                if (src !== undefined && item !== undefined) {
+                    item.pendingRemote = {
+                        renderedText: src.rendered,
+                        fingerprint: c.newFingerprint,
+                        payload: src.payload,
+                        detectedAt: this.#now(),
+                    };
+                }
+            }
+            for (const [key, item] of Object.entries(state.items)) {
+                if (!candidateKeys.has(key) && item.pendingRemote !== undefined) {
+                    item.pendingRemote = undefined;
+                }
+            }
+        }
         for (const c of plan.candidates) {
             outcome.candidatesReport.push({ sourceKey: c.sourceKey, reason: "source-changed" });
             outcome.candidates += 1;
@@ -455,6 +512,9 @@ export class SyncEngine {
         if (plan.skipped) {
             return { outcome: { ...outcome, skipped: true, skipReason: plan.skipReason }, index };
         }
+        // 审阅整改 M5：候选检测立即落盘——先于文档确保等任何后续失败路径；
+        // 否则失败轮只上报不持久，复发性错误会让候选永远进不了审阅队列（AC4 可恢复性）
+        await store.save(state);
 
         // ---- 文档确保（含丢失找回）----
         const docEnsured = await this.#ensureDoc(index, oplog, store, state, bookId, title);
@@ -941,6 +1001,302 @@ export class SyncEngine {
         };
         await store.save(state);
         return state;
+    }
+
+    // ---------- T03：审阅队列与受控决策 ----------
+
+    /** 审阅队列：全量扫描各书状态中的 pendingRemote（local 为当前块实况回读）。 */
+    async buildReviewQueue(): Promise<ReviewCandidate[]> {
+        const index = await this.#indexStore().load();
+        if (index === undefined) {
+            return [];
+        }
+        const queue: ReviewCandidate[] = [];
+        for (const [bookId, entry] of Object.entries(index.books)) {
+            const store = this.#bookStore(bookId);
+            let state: BookSyncState | undefined;
+            try {
+                state = await store.load();
+            } catch {
+                continue; // 单书损坏不阻塞整个队列
+            }
+            if (state === undefined) {
+                continue;
+            }
+            for (const [sourceKey, item] of Object.entries(state.items)) {
+                if (item.pendingRemote === undefined || item.blockId === undefined || item.status !== "active") {
+                    continue; // 审阅整改 M4：非 active（隔离/已删/移出）不入审阅队列
+                }
+                const kramdown = await this.#writer.getBlockKramdown(item.blockId);
+                const local = kramdown !== undefined ? stripIal(kramdown) : item.localBaseline ?? "";
+                const baseline = item.localBaseline ?? "";
+                const conflict = classifyConflict(baseline, local, item.pendingRemote.renderedText);
+                queue.push({
+                    bookId,
+                    bookTitle: entry.title ?? bookId,
+                    sourceKey,
+                    kind: item.kind,
+                    blockId: item.blockId,
+                    baseline,
+                    local,
+                    remote: item.pendingRemote.renderedText,
+                    remoteFingerprint: item.pendingRemote.fingerprint,
+                    conflict,
+                    detectedAt: item.pendingRemote.detectedAt,
+                });
+            }
+        }
+        return queue;
+    }
+
+    /**
+     * 执行用户决策（唯一块更新写入口，设计契约 §2/§3）。
+     * expectedLocal 为决策时快照（队列会话缓存），与现状不符 → 过期拒绝（AC4）；
+     * expectedFingerprint 为决策时远端版本（会话缓存），不一致同样过期重审（整改 INFO9）。
+     */
+    async applyDecision(
+        sourceKey: string,
+        action: "apply-remote" | "keep-local" | "manual-merge" | "save-copy" | "defer",
+        manualText: string | undefined,
+        expectedLocal: string,
+        expectedFingerprint?: string,
+    ): Promise<ApplyResult> {
+        const ref = parseSourceKey(sourceKey);
+        const store = this.#bookStore(ref.bookId);
+        const state = await store.load();
+        if (state === undefined) {
+            return { ok: false, kind: "not-found", message: "未找到该书同步状态" };
+        }
+        const item = state.items[sourceKey];
+        if (item === undefined || item.pendingRemote === undefined || item.blockId === undefined) {
+            return { ok: false, kind: "not-found", message: "该条目没有待审变更" };
+        }
+        if (
+            expectedFingerprint !== undefined &&
+            item.pendingRemote.fingerprint !== expectedFingerprint
+        ) {
+            // 审阅整改 INFO9：会话期内远端刷新（又同步过）→ 过期重审，不静默应用最新版
+            return {
+                ok: false,
+                kind: "stale",
+                message: "远端内容已更新（期间发生过同步），请重新审阅最新版本",
+            };
+        }
+        if (item.status !== "active") {
+            // 审阅整改 M4：隔离/已删/移出条目禁止经决策路径写入（防绕过多块歧义保护）
+            return {
+                ok: false,
+                kind: "not-found",
+                message: `该条目处于 ${item.status} 状态，不可自动应用决策；请先处理该状态`,
+            };
+        }
+        const oplog = await this.#loadOpLog();
+        if (action === "defer") {
+            return { ok: true };
+        }
+        if (action === "keep-local") {
+            // 不写块：推进已处理远端版本 + 本地为权威 → 同一远端版本不再打扰（AC3）
+            item.versionFingerprint = item.pendingRemote.fingerprint;
+            item.override = true;
+            item.pendingRemote = undefined;
+            await store.save(state);
+            await oplog.append({
+                opId: this.#opId(),
+                ts: this.#now(),
+                intent: "decision",
+                sourceKey,
+                status: "done",
+                error: "keep-local",
+            });
+            return { ok: true };
+        }
+        if (action === "save-copy") {
+            if (state.docId === undefined) {
+                return { ok: false, kind: "not-found", message: "书籍文档未确定，无法另存副本" };
+            }
+            // 副本带 custom-wrs-copy-of 溯源属性，不带 custom-wrs-src——不建第二规范映射
+            const copyMarkdown = `${item.pendingRemote.renderedText} {: custom-wrs-copy-of="${sourceKey}"}`;
+            const opId = this.#opId();
+            await oplog.append({ opId, ts: this.#now(), intent: "create-block", sourceKey, payloadText: copyMarkdown, status: "pending" });
+            try {
+                const copyId = await this.#writer.appendChildBlock(copyMarkdown, state.docId);
+                const readback = await this.#writer.getBlockKramdown(copyId);
+                if (readback === undefined) {
+                    await oplog.fail(opId, "副本回读失败");
+                    return { ok: false, kind: "kernel", message: "副本写入后回读失败" };
+                }
+                await oplog.complete(opId, { blockId: copyId });
+                item.versionFingerprint = item.pendingRemote.fingerprint;
+                item.override = true;
+                item.pendingRemote = undefined;
+                await store.save(state);
+                return { ok: true };
+            } catch (e) {
+                await oplog.fail(opId, (e as Error).message);
+                return { ok: false, kind: "kernel", message: `副本写入失败：${(e as Error).message}` };
+            }
+        }
+        // apply-remote / manual-merge → §3 受控原位更新。
+        // manual-merge 裁决（审阅整改 B1）：manualText 即最终 markdown（UI 预填远端渲染文本），
+        // 仅 trim 规范化、不做二次渲染——"预填→确认"幂等，用户对合并结果有完全控制权
+        const newRendered =
+            action === "apply-remote"
+                ? item.pendingRemote.renderedText
+                : renderManualMerge(item.localBaseline ?? "", manualText ?? "");
+        // 基线推进统一以"已处理的远端版本"为准（manual-merge 亦是审阅了该远端版本的结果），
+        // 否则手动合并的指纹永不匹配来源 → 永续候选
+        const remoteFingerprint = item.pendingRemote.fingerprint;
+        const remotePayload = item.pendingRemote.payload;
+        const overrideAfter = action === "manual-merge";
+        return this.#applyControlledUpdate(store, state, oplog, sourceKey, item, expectedLocal, newRendered, remotePayload, remoteFingerprint, overrideAfter);
+    }
+
+    /** §3 协议：快照校验 → 意图持久化 → updateBlock → 回读验证 ID/属性 → 记账。任一步失败安全停。 */
+    async #applyControlledUpdate(
+        store: GenerationStore<BookSyncState>,
+        state: BookSyncState,
+        oplog: OpLog,
+        sourceKey: string,
+        item: ItemState,
+        expectedLocal: string,
+        newRendered: string,
+        remotePayload: Record<string, unknown>,
+        remoteFingerprint: string,
+        overrideAfter: boolean,
+    ): Promise<ApplyResult> {
+        const blockId = item.blockId!;
+        // 步骤 2 前置重读：现状必须等于决策时快照（过期计划拒绝，AC4）
+        const current = await this.#writer.getBlockKramdown(blockId);
+        if (current === undefined) {
+            return { ok: false, kind: "missing", message: "目标块不存在（可能已被删除）" };
+        }
+        const currentStripped = stripIal(current);
+        if (currentStripped.trim() !== expectedLocal.trim()) {
+            return { ok: false, kind: "stale", message: "内容已在决策后发生变化，计划过期，请重新审阅" };
+        }
+        // 步骤 1：意图持久化
+        const opId = this.#opId();
+        item.pendingUpdate = {
+            opId,
+            before: currentStripped,
+            after: newRendered,
+            startedAt: this.#now(),
+            remoteFingerprint,
+            remotePayload,
+        };
+        await store.save(state);
+        await oplog.append({
+            opId,
+            ts: this.#now(),
+            intent: "update-block",
+            sourceKey,
+            beforeText: currentStripped,
+            afterText: newRendered,
+            status: "pending",
+        });
+        try {
+            // 步骤 3：唯一用户批准写入口；markdown 自带 IAL 保身份
+            const markdown = `${newRendered} {: id="${blockId}" custom-wrs-src="${sourceKey}"}`;
+            await this.#writer.updateBlockContent(markdown, blockId);
+            // 步骤 4：回读验证（内容 + 同 ID 可读 + 身份属性保留）
+            const after = await this.#writer.getBlockKramdown(blockId);
+            if (after === undefined) {
+                // 验证回读不可得（块缺失或读取异常）≠ 验证逻辑失败：
+                // 不判死、不隔离——意图留存，下轮 reconcile 按块实况裁决（落地→收养/未落地→重议/缺失→隔离）
+                await oplog.fail(opId, "验证回读失败，意图留存待下轮核对");
+                return {
+                    ok: false,
+                    kind: "kernel",
+                    message: "更新后验证回读失败，已留存意图，下轮同步核对后恢复",
+                };
+            }
+            if (
+                stripIal(after) !== newRendered ||
+                this.#extractIalAttr(after, "custom-wrs-src") !== sourceKey
+            ) {
+                // 回读成功但 ID 变化/属性丢失/内容不符 → 隔离 + 保留快照（oplog 含 before/after）+ 上报，不自动补救写
+                item.status = "quarantined";
+                item.pendingUpdate = undefined;
+                item.pendingRemote = undefined;
+                await store.save(state);
+                await oplog.fail(opId, "更新后回读验证失败（ID/属性/内容未保持），已隔离保留快照");
+                return {
+                    ok: false,
+                    kind: "kernel",
+                    message: "更新后验证失败：块 ID/身份属性/内容未保持，已隔离并保留快照，请人工检查",
+                };
+            }
+            // 步骤 5：记账推进（指纹=已处理远端版本；sourcePayload=远端载荷，供后续 diff 基准）
+            item.renderedText = newRendered;
+            item.localBaseline = stripIal(after);
+            item.sourcePayload = remotePayload;
+            item.versionFingerprint = remoteFingerprint;
+            item.override = overrideAfter;
+            item.pendingRemote = undefined;
+            item.pendingUpdate = undefined;
+            await store.save(state);
+            await oplog.complete(opId, { blockId });
+            return { ok: true };
+        } catch (e) {
+            // 写失败：意图留存待重入核对（before 未落地 → 清除重议）；此处不重试
+            await oplog.fail(opId, (e as Error).message);
+            return { ok: false, kind: "kernel", message: `更新失败（未重试，可重入恢复）：${(e as Error).message}` };
+        }
+    }
+
+    /** pendingUpdate 重入核对：after→收养（推进基线）/ before→清除重议 / 其他或不可读→隔离。 */
+    async #reconcilePendingUpdates(
+        store: GenerationStore<BookSyncState>,
+        state: BookSyncState,
+    ): Promise<{ state: BookSyncState; quarantined: number }> {
+        let quarantined = 0;
+        let changed = false;
+        for (const [sourceKey, item] of Object.entries(state.items)) {
+            const pending = item.pendingUpdate;
+            if (pending === undefined || item.blockId === undefined) {
+                continue;
+            }
+            const kramdown = await this.#writer.getBlockKramdown(item.blockId);
+            if (kramdown === undefined) {
+                item.status = "quarantined";
+                item.pendingUpdate = undefined;
+                quarantined += 1;
+                changed = true;
+                continue;
+            }
+            const stripped = stripIal(kramdown);
+            if (
+                stripped === pending.after &&
+                this.#extractIalAttr(kramdown, "custom-wrs-src") === sourceKey
+            ) {
+                // 更新已落地且身份保持：补记账推进基线（审阅整改 M2：收养须补完身份验证——
+                // 否则丢身份的块被当健康块收养，对审计/重建 SQL 永久不可见）
+                item.renderedText = pending.after;
+                item.localBaseline = stripped;
+                item.sourcePayload = pending.remotePayload;
+                item.versionFingerprint = pending.remoteFingerprint;
+                item.pendingUpdate = undefined;
+                item.pendingRemote = undefined;
+                changed = true;
+            } else if (
+                stripped === pending.before &&
+                this.#extractIalAttr(kramdown, "custom-wrs-src") === sourceKey
+            ) {
+                // 未落地（身份保持）：清除意图，候选保留待重议（复核随行：before 分支同样校验身份）
+                item.pendingUpdate = undefined;
+                changed = true;
+            } else {
+                // 内容落地但身份丢失，或不可解释状态 → 隔离待人工裁决
+                item.status = "quarantined";
+                item.pendingUpdate = undefined;
+                quarantined += 1;
+                changed = true;
+            }
+        }
+        if (changed) {
+            await store.save(state);
+        }
+        return { state, quarantined };
     }
 
     // ---------- 小工具 ----------

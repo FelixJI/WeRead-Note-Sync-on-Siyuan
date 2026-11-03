@@ -33,6 +33,26 @@ export const SETTINGS_TEXT_FALLBACK = {
     settingFailKindInvalidKey: "API Key 无效：应以 wrk- 开头、总长度不少于 12 个字符。",
     settingFailUnexpected: "连接测试出现未预期的错误，请重试。",
     settingKeyCleared: "已清除 API Key（会话内存与本机存储）。",
+    settingAccountLabel: "账号标识",
+    settingAccountPlaceholder: "例如：我的微信读书主账号",
+    settingAccountHint:
+        "用于区分不同微信读书账号的笔记身份（参与内容绑定）。请自行命名并记住；更换 API Key 不会自动更换账号，若确实换了账号，请显式修改此标识。",
+    settingAccountInvalid: "账号标识包含不支持的字符",
+    commandSyncNow: "立即同步",
+    syncNeedApiKey: "请先在设置中填写有效的微信读书 API Key。",
+    syncNeedAccount: "请先在设置中填写账号标识（区分不同微信读书账号）。",
+    syncKeyChangedWarning: "检测到 API Key 与上次不同。若您更换了微信读书账号，请同步修改账号标识；同一账号换新 Key 无需处理。",
+    syncRunning: "同步进行中…",
+    syncDoneOk: "同步完成。",
+    syncDoneWithError: "同步结束（有错误）：",
+    syncCreatedCount: "新增",
+    syncCandidateCount: "待审变更",
+    syncProtectedCount: "受保护项",
+    syncBookErrorCount: "出错书籍",
+    syncItemErrorCount: "跳过的异常条目",
+    syncDeferredCount: "本轮未覆盖书籍（下轮轮转继续）",
+    syncSkippedCount: "整书跳过（回包异常或保护模式，详见跳过原因）",
+    syncUnexpectedError: "同步出现未预期的错误，请重试。",
 } as const;
 
 export type SettingsTextKey = keyof typeof SETTINGS_TEXT_FALLBACK;

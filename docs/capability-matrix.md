@@ -27,14 +27,24 @@
 | errcode/upgrade_info/鉴权失败语义 | 同上 | MOCK-TESTED | tests/contracts/gateway.test.ts |
 | Key 脱敏（wrk- 前缀、Bearer） | 纯函数 | MOCK-TESTED | tests/contracts/redact.test.ts |
 | 白名单守卫（唯一网关 URL） | 纯函数 | MOCK-TESTED | tests/contracts/whitelist.test.ts |
+| 非破坏导入引擎（幂等/块映射/中断恢复/保护状态，AC1–AC7） | 引擎 + FakeKernel 故障注入 | MOCK-TESTED（tests/sync/engine.test.ts 20 例 + 纯函数层 98 例，2026-11-03 T02） | 设计契约 docs/design/t02-sync-core.md |
 | 真实网关连通（有效/无效 Key） | — | UNVERIFIED-LIVE | 需用户本地 Key；代码路径已具备 |
-| 思源块原位更新后 ID/属性/引用保留 | — | UNVERIFIED-LIVE | 需授权隔离内核；未实测前不进入自动写入路径 |
+| 思源块原位更新后 ID/属性/引用保留 | — | UNVERIFIED-LIVE | T02 未启用任何原位更新路径（只新建）；待授权隔离内核取证 |
 | 思源 localStorage 密钥存储同步范围 | — | UNVERIFIED-LIVE | 文档如实标注：按端本地存储，非加密、不经内核同步 |
+| 账号命名空间 | 用户显式配置 + keyMarker 换 Key 提醒 | 已实现（不自动换账号）；服务端身份字段探测 UNVERIFIED-LIVE | src/settings/account-store.ts |
 
 ## 代理解包
 
 - 请求：`forwardProxy`（headers 数组、payloadEncoding=json、responseEncoding=text）→ `data.status`/`data.body`。
 - 结论：桌面/浏览器共享同一 `Transport` 抽象；真实内核下的状态码透传与重定向行为 UNVERIFIED-LIVE。
+
+## T02 整改后的 UNVERIFIED-LIVE 假设（合并门禁裁决，T06 取证）
+
+1. 内核将创建 markdown 尾随 IAL 绑定到块并写入 blocks.ial（FakeKernel 假设，真实内核未测）；
+2. getBlockKramdown 回读正文与渲染文本逐字一致、IAL 位于尾部；
+3. 内核 SQL（blocks.ial LIKE + ESCAPE）行为与 SQLite 语义一致；
+4. 无属性孤儿块（IAL 未落的创建窗口）会发生一次可见重复，无法自动认领（接受风险）；
+5. updateBlock 原位更新语义（T03 前置）：完全未验证，T02 零调用。
 
 ## 遗留契约缺口（移交 T02 实测解决）
 

@@ -310,7 +310,7 @@ export class SyncEngine {
                         author: nb.author,
                         progressPercent: nb.readingProgress,
                         finished: nb.markedStatus === 1,
-                        unseen: !roundBookIds.has(nb.bookId),
+                        unseen: false, // 本轮书目已返回；unseen 由下方补充循环判定
                         syncedThisRound: oc !== undefined && oc.error === undefined && !oc.skipped,
                     });
                 }

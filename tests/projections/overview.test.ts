@@ -164,6 +164,28 @@ describe("T04 原生阅读总览投影", () => {
         expect(entry.markdown).toContain("三体：新版"); // 标签随来源刷新
     });
 
+    it("整改MAJOR1：标签含 & \" > 的书名/摘录 → 全角化写入（规避内核实体转义），两轮幂等无安全停", async () => {
+        const books = fixture();
+        books["10001"]!.title = '三体&"地球>往事';
+        books["10001"]!.highlights[0]!.markText = '给岁月以文明&"而不是>给文明以岁月';
+        const { kernel, engine } = makeDeps(books);
+        const r1 = await engine.syncRound();
+        expect(r1.ok).toBe(true);
+        expect(r1.projectionErrors).toBeUndefined();
+        const ov = overviewDocs(kernel)[0]!;
+        // 全部投影块写入内容不含触发实体转义的半角字符
+        const proj = kernel.allBlocks().filter((b) => b.rootId === ov.id || b.ial["custom-wrs-entry"] !== undefined || b.ial["custom-wrs-section"] === "bookmeta");
+        for (const b of proj) {
+            expect(b.markdown).not.toContain("&");
+            expect(b.markdown).not.toContain('"');
+            expect(b.markdown).not.toContain(">");
+        }
+        expect(kernel.allBlocks().some((b) => b.markdown.includes("三体＆＂地球＞往事"))).toBe(true);
+        const r2 = await engine.syncRound();
+        expect(r2.ok).toBe(true);
+        expect(r2.projectionErrors).toBeUndefined(); // 回读全等成立，无死循环
+    });
+
     it("AC2：清单条目为原生动态块引用；最近摘录引用真实锚点块且不复制正文（30 字截断）", async () => {
         const books = fixture();
         const longText = "这是一条超过三十个字符长度限制的划线内容用于验证截断行为是否生效ABC";

@@ -71,8 +71,10 @@ function truncateChars(text: string, maxChars: number): string {
 }
 
 /**
- * 块引用标签安全化：控制字符压平、单引号/圆括号/尖括号全角化。
- * 双重防护：`((id '…'))` 引用语法不可逃逸 + 远端文本永不解释为 HTML（T01 不变量）。
+ * 块引用标签安全化：控制字符压平、单引号/圆括号/尖括号/与号/双引号全角化。
+ * 三重防护：`((id '…'))` 引用语法不可逃逸 + 远端文本永不解释为 HTML（T01 不变量）
+ * + 审阅整改 MAJOR-1：真实内核（Lute format renderer）对引用标签做 HTML 实体转义
+ *   （& → &amp; 等），写入端全角化使标签不含触发字符，回读全等比较才可长期成立。
  */
 function sanitizeRefLabel(text: string): string {
     return text
@@ -81,6 +83,9 @@ function sanitizeRefLabel(text: string): string {
         .replace(/\(/g, "（")
         .replace(/\)/g, "）")
         .replace(/</g, "＜")
+        .replace(/>/g, "＞")
+        .replace(/&/g, "＆")
+        .replace(/"/g, "＂")
         .replace(/\{:/g, "｛:")
         .replace(/\s+/g, " ")
         .trim();
@@ -172,24 +177,6 @@ export function formatBookMetaLine(input: BookMetaInput, texts: OverviewTexts = 
  * 从条目状态还原摘录纯文本：优先 sourcePayload.markText；
  * 无载荷（收养条目）时从 blockquote 渲染快照去 `> ` 前缀取首个非空行。
  */
-export function excerptTextOf(item: {
-    sourcePayload: Record<string, unknown>;
-    renderedText: string;
-}): string {
-    const raw = item.sourcePayload.markText;
-    let text = typeof raw === "string" && raw.trim().length > 0 ? raw : "";
-    if (text.length === 0) {
-        for (const line of item.renderedText.split(/\r\n|\r|\n/)) {
-            const stripped = line.replace(/^>\s?/u, "").trim();
-            if (stripped.length > 0) {
-                text = stripped;
-                break;
-            }
-        }
-    }
-    return text.replace(/[\u0000-\u001F\u007F]/g, " ").replace(/\s+/g, " ").trim();
-}
-
 // ---------- 投影输入 ----------
 
 export interface BookProjectionInfo {
@@ -406,7 +393,12 @@ async function resolveOverviewDoc(ctx: ProjectionCtx): Promise<{ docId: string; 
     const ns = index.accountNamespace;
     if (index.overviewDocId !== undefined) {
         const kramdown = await writer.getBlockKramdown(index.overviewDocId);
-        if (kramdown !== undefined) {
+        // 审阅整改 MINOR-2：缓存命中须验属性（防属性被清/错乱文档被当总览写入骨架）
+        if (
+            kramdown !== undefined &&
+            extractIalAttr(kramdown, "custom-wrs-overview") === "1" &&
+            extractIalAttr(kramdown, "custom-wrs-account") === ns
+        ) {
             return { docId: index.overviewDocId, created: false };
         }
     }
@@ -424,6 +416,25 @@ async function resolveOverviewDoc(ctx: ProjectionCtx): Promise<{ docId: string; 
         // SQL 命中但回读失败（索引滞后或已删）：不写该块，走重建
     }
     const lost = index.overviewDocId !== undefined; // 有缓存却找不到 → 曾丢失
+    // 审阅整改 MINOR-3：半程失败孤儿认领——仅认领"空且无 custom-wrs-overview"的同名文档，
+    // 防止 createBookDoc 成功而 setBlockAttrs 失败的窗口累积空副本
+    {
+        const esc = (x: string): string => x.replaceAll("'", "''");
+        const byTitle = await writer.sql(
+            `select id from blocks where type='d' and content='${esc(ctx.texts.overviewDocTitle)}' and box='${esc(ctx.deps.notebookId)}' and ial not like '%custom-wrs-overview=%'`,
+        );
+        if (byTitle.length === 1) {
+            const cand = byTitle[0].id;
+            const children = await writer.sql(
+                `select id from blocks where root_id='${esc(cand)}' and id != '${esc(cand)}'`,
+            );
+            if (children.length === 0) {
+                await writer.setBlockAttrs(cand, { "custom-wrs-overview": "1", "custom-wrs-account": ns });
+                ctx.anomalies.push("认领了创建中断遗留的空总览孤儿文档");
+                return { docId: cand, created: true };
+            }
+        }
+    }
     const opId = ctx.deps.newOpId();
     await ctx.deps.oplog.append({
         opId,

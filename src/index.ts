@@ -233,6 +233,10 @@ export default class WereadNoteSyncPlugin extends Plugin {
                 // 复核随行修复：书级整书跳过（如回包异常）必须可见，不得显示为"成功+全零"
                 parts.push(`${text.syncSkippedCount}: ${skippedBooks}`);
             }
+            if ((outcome.projectionAnomalies?.length ?? 0) > 0) {
+                // 审阅整改 MINOR-4：投影告警（复盘区缺失/歧义跳过等）必须对用户可见
+                parts.push(`${text.syncProjectionAnomalyCount}: ${outcome.projectionAnomalies!.length}`);
+            }
             if (!outcome.ok || bookErrors > 0 || skippedBooks > 0) {
                 showMessage(
                     `${text.syncDoneWithError}${parts.join("，")}，${text.syncBookErrorCount}: ${bookErrors}`,

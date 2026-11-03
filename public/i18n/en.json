@@ -84,5 +84,6 @@
     "reviewApplyFailedPrefix": "Action failed: ",
     "reviewDeferredGroup": "Deferred",
     "reviewRestoreDeferred": "Restore",
-    "reviewDeferredHint": "Deferred items keep their state and are not lost; they reappear after refreshing or reopening the review."
+    "reviewDeferredHint": "Deferred items keep their state and are not lost; they reappear after refreshing or reopening the review.",
+    "syncProjectionAnomalyCount": "overview projection notices"
 }

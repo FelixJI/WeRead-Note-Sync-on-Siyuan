@@ -84,5 +84,6 @@
     "reviewApplyFailedPrefix": "操作失败：",
     "reviewDeferredGroup": "稍后处理",
     "reviewRestoreDeferred": "恢复审阅",
-    "reviewDeferredHint": "稍后处理的条目状态未改动也不会丢失，刷新或重新打开审阅后会重新出现。"
+    "reviewDeferredHint": "稍后处理的条目状态未改动也不会丢失，刷新或重新打开审阅后会重新出现。",
+    "syncProjectionAnomalyCount": "总览投影告警"
 }

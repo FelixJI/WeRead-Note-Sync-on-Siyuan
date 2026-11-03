@@ -53,6 +53,7 @@ export const SETTINGS_TEXT_FALLBACK = {
     syncItemErrorCount: "跳过的异常条目",
     syncDeferredCount: "本轮未覆盖书籍（下轮轮转继续）",
     syncSkippedCount: "整书跳过（回包异常或保护模式，详见跳过原因）",
+    syncProjectionAnomalyCount: "总览投影告警",
     syncUnexpectedError: "同步出现未预期的错误，请重试。",
     reviewDialogTitle: "审阅变更",
     reviewClose: "关闭",

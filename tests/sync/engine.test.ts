@@ -487,6 +487,7 @@ function makeDeps(books: Record<string, BookScript>) {
         accountNamespace: NS,
         now: () => "2026-11-03T00:00:00Z",
         newOpId: () => `op-${String((seq += 1)).padStart(4, "0")}`,
+        projectOverview: false,
     });
     return { transport, kernel, persistence, engine };
 }

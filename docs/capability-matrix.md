@@ -52,6 +52,13 @@
 - manual-merge 语义（主代理裁决，整改 B1）：manualText 即最终 markdown（UI 预填远端渲染文本、仅 trim 规范化），"预填→确认"幂等。
 - isDecisionStale/sortCandidates 为公共工具保留（引擎内联等价实现；审阅 INFO8）。
 
+## T04 审阅裁决补充（2026-11-03）
+
+- **块引用标签实体转义（审阅 MAJOR-1）**：真实内核（Lute）对 `((id 'label'))` 标签做 HTML 实体转义（& " > 等）；本仓以写入端全角化规避（sanitizeRefLabel），回读全等比较成立的前提=标签不含触发字符——**真实内核回读形态仍未实测（UNVERIFIED-LIVE），T06 一并取证**；FakeKernel 不模拟实体转义（原样回显），相关测试不构成内核行为证据。
+- **readingProgress/markedStatus 语义（审阅 MINOR-5）**：/user/notebooks 未文档化此二字段；按 0-100 与 1=读完假设实现，UNVERIFIED-LIVE，T05/T06 真实回包校准。
+- **AC5 视觉证据**：桌面/浏览器、深浅色、窄窗截图与操作证据 UNVERIFIED-LIVE（无 GUI 环境），T06 GAC6 实测。
+- 投影时机：整轮部分失败仍投影（失败书 syncedThisRound=false 不更新其 meta）——设计契约 §4 补充说明。
+
 ## 遗留契约缺口（移交 T02 实测解决）
 
 - **账号命名空间来源**：现有官方技能契约接口（notebooks/shelf/readdata 等）均未文档化"自身份（vid）"字段。Goal 要求账号命名空间不得以 Key 哈希定义、换 Key 不自动换账号。T02 方案：取得真实 Key 后优先探测服务端身份字段（`/_list` 及全量回包未文档化字段）；若确无可用身份字段，则由用户在首次配置时显式选择/确认账号标签，并显式确认 Key↔账号变更，绝不静默推导。

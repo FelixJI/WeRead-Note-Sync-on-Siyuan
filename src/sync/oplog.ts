@@ -12,7 +12,8 @@ export interface OpLogEntry {
         | "adopt"
         | "quarantine"
         | "update-block"
-        | "decision";
+        | "decision"
+        | "project";
     sourceKey?: string;
     blockId?: string;
     payloadText?: string;

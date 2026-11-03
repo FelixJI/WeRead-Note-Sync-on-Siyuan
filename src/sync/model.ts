@@ -71,6 +71,8 @@ export interface SyncIndex {
     accountNamespace: string;
     keyMarker?: string;
     notebookId?: string;
+    /** T04：总览文档缓存（仅缓存；可由 custom-wrs-overview="1" 属性 SQL 重建，不以缓存作存在性证据） */
+    overviewDocId?: string;
     /** 书目轮转游标（T02 审阅整改 M5）：每轮从该下标开始处理，避免固定截断饥饿 */
     rotation?: number;
     books: Record<string, { docId?: string; title?: string; generation: number }>;

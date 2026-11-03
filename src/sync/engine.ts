@@ -38,6 +38,7 @@ import { computePlan, type SyncPlan } from "./plan";
 import { OpLog, type OpLogEntry } from "./oplog";
 import { makeSourceKey, parseSourceKey, type SourceKind } from "./identity";
 import { classifyConflict, renderManualMerge } from "../review/model";
+import { projectOverview, type BookProjectionInfo, type RecentHighlightCandidate } from "../projections/overview";
 
 export interface SyncEngineDeps {
     persistence: StatePersistence;
@@ -48,6 +49,8 @@ export interface SyncEngineDeps {
     /** 注入时钟与 opId 生成，保证测试确定性 */
     now?: () => string;
     newOpId?: () => string;
+    /** T04：轮末总览投影开关（默认开启；测试/特殊场景可关） */
+    projectOverview?: boolean;
 }
 
 export interface BookSyncOutcome {
@@ -74,6 +77,10 @@ export interface RoundOutcome {
     books: BookSyncOutcome[];
     /** 本轮因上限未覆盖的书数（轮转游标保证下轮优先，整改 M5） */
     deferredBooks: number;
+    /** T04：总览投影失败数（投影失败不影响同步本体结果） */
+    projectionErrors?: number;
+    /** T04：投影如实上报（歧义跳过/重建/复盘区缺失等） */
+    projectionAnomalies?: string[];
     candidatesReport: Array<{ bookId: string; sourceKey: string; reason: string }>;
     protectedReport: Array<{ bookId: string; sourceKey: string; reason: string }>;
 }
@@ -282,7 +289,68 @@ export class SyncEngine {
             }
         }
 
-        // 复核随行修复：index 全轮累积后单次持久化（含轮转游标）——
+        // T04：轮末总览投影（失败不影响同步本体结果；投影只写带插件属性的块）
+        let projectionErrors = 0;
+        const projectionAnomalies: string[] = [];
+        if (this.#deps.projectOverview !== false && index.notebookId !== undefined && total > 0) {
+            try {
+                const roundBookIds = new Set(notebooks.books.map((b) => b.bookId));
+                const outcomeByBook = new Map(books.map((b) => [b.bookId, b]));
+                const booksInfo: BookProjectionInfo[] = [];
+                for (const nb of notebooks.books) {
+                    const entry = index.books[nb.bookId];
+                    const oc = outcomeByBook.get(nb.bookId);
+                    if (entry?.docId === undefined) {
+                        continue;
+                    }
+                    booksInfo.push({
+                        bookId: nb.bookId,
+                        docId: entry.docId,
+                        title: nb.title ?? nb.bookId,
+                        author: nb.author,
+                        progressPercent: nb.readingProgress,
+                        finished: nb.markedStatus === 1,
+                        unseen: false, // 本轮书目已返回；unseen 由下方补充循环判定
+                        syncedThisRound: oc !== undefined && oc.error === undefined && !oc.skipped,
+                    });
+                }
+                // unseen 补充：index 有但本轮书目未返回的书（条目保留标记）
+                for (const [bookId, entry] of Object.entries(index.books)) {
+                    if (entry?.docId !== undefined && !roundBookIds.has(bookId) && !booksInfo.some((b) => b.bookId === bookId)) {
+                        booksInfo.push({
+                            bookId,
+                            docId: entry.docId,
+                            title: entry.title ?? bookId,
+                            unseen: true,
+                            syncedThisRound: false,
+                        });
+                    }
+                }
+                const projection = await projectOverview({
+                    writer: this.#writer,
+                    oplog,
+                    notebookId: index.notebookId,
+                    index,
+                    books: booksInfo,
+                    loadRecentHighlights: () => this.#loadRecentHighlights(index),
+                    now: () => this.#now(),
+                    newOpId: () => this.#opId(),
+                });
+                if (projection.overviewDocId !== undefined) {
+                    index = { ...index, overviewDocId: projection.overviewDocId };
+                }
+                projectionAnomalies.push(...projection.anomalies);
+                if (projection.error !== undefined) {
+                    projectionErrors += 1;
+                    projectionAnomalies.push(projection.error);
+                }
+            } catch (e) {
+                projectionErrors += 1;
+                projectionAnomalies.push(`投影异常（安全停）：${(e as Error).message}`);
+            }
+        }
+
+        // 复核随行修复：index 全轮累积后单次持久化（含轮转游标与总览缓存）——
         // 此前书级/轮转各自保存共享陈旧 base，会互相覆盖 books 条目
         const nextRotation = (rotation + picked.length) % (total === 0 ? 1 : total);
         await indexStore.save({ ...index, rotation: nextRotation });
@@ -297,7 +365,15 @@ export class SyncEngine {
                 protectedReport.push({ bookId: b.bookId, ...r });
             }
         }
-        return { ok, books, deferredBooks, candidatesReport, protectedReport };
+        return {
+            ok,
+            books,
+            deferredBooks,
+            ...(projectionErrors > 0 ? { projectionErrors } : {}),
+            ...(projectionAnomalies.length > 0 ? { projectionAnomalies } : {}),
+            candidatesReport,
+            protectedReport,
+        };
     }
 
     // ---------- 索引 ----------
@@ -1297,6 +1373,37 @@ export class SyncEngine {
             await store.save(state);
         }
         return { state, quarantined };
+    }
+
+    /** T04：最近摘录候选（跨书取 highlight 活跃锚点，按来源 createTime 降序） */
+    async #loadRecentHighlights(index: SyncIndex): Promise<RecentHighlightCandidate[]> {
+        const all: RecentHighlightCandidate[] = [];
+        for (const [bookId] of Object.entries(index.books)) {
+            const store = this.#bookStore(bookId);
+            let state: BookSyncState | undefined;
+            try {
+                state = await store.load();
+            } catch {
+                continue;
+            }
+            if (state === undefined) {
+                continue;
+            }
+            for (const [sourceKey, item] of Object.entries(state.items)) {
+                if (item.kind !== "highlight" || item.status !== "active" || item.blockId === undefined) {
+                    continue;
+                }
+                const raw = item.sourcePayload as { createTime?: unknown };
+                all.push({
+                    blockId: item.blockId,
+                    sourceKey,
+                    createTime: typeof raw.createTime === "number" ? raw.createTime : undefined,
+                    text: stripIal(item.renderedText).replace(/^> /gmu, ""),
+                });
+            }
+        }
+        all.sort((a, b) => (b.createTime ?? 0) - (a.createTime ?? 0));
+        return all;
     }
 
     // ---------- 小工具 ----------

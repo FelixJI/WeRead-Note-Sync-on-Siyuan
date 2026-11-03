@@ -9,3 +9,24 @@
     color: var(--b3-theme-on-background);
     font-size: 14px;
 }
+
+
+/* T04 统一样式约定：仅插件自有 UI 作用域（.weread-note-sync-*），绝不注入笔记内容 */
+.weread-note-sync-status {
+    color: var(--b3-theme-on-surface);
+    font-size: 12px;
+}
+.weread-note-sync-status--ok {
+    color: var(--b3-card-success-color, var(--b3-theme-primary));
+}
+.weread-note-sync-status--warn {
+    color: var(--b3-card-warning-color, #d23f31);
+}
+.weread-note-sync-entry-label {
+    font-weight: 500;
+    color: var(--b3-theme-on-background);
+}
+.weread-note-sync-muted {
+    color: var(--b3-theme-on-surface);
+    opacity: 0.75;
+}

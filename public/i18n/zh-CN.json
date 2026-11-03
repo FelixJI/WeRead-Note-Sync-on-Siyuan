@@ -85,5 +85,20 @@
     "reviewDeferredGroup": "稍后处理",
     "reviewRestoreDeferred": "恢复审阅",
     "reviewDeferredHint": "稍后处理的条目状态未改动也不会丢失，刷新或重新打开审阅后会重新出现。",
-    "syncProjectionAnomalyCount": "总览投影告警"
+    "syncProjectionAnomalyCount": "总览投影告警",
+    "statsMenuLabel": "阅读统计",
+    "statsTitle": "阅读统计",
+    "statsLoading": "统计加载中…",
+    "statsRefresh": "刷新",
+    "statsPrevYear": "上一年",
+    "statsNextYear": "下一年",
+    "statsNoDaily": "年度日明细缺失，热力图暂不可用（未伪造数据）",
+    "statsMonthlyOnly": "仅有月度数据，按契约不绘制日热力图",
+    "statsUnknownDay": "未知（无日级数据）",
+    "statsLegend": "图例",
+    "statsLegendValue": "有阅读（越深越多）",
+    "statsLegendZero": "零",
+    "statsLegendUnknown": "未知",
+    "statsLegendFuture": "未来日期空白",
+    "statsBookTimes": "单书累计时长（近同步前 10 本）"
 }

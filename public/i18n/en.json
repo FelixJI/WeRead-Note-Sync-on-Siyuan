@@ -85,5 +85,20 @@
     "reviewDeferredGroup": "Deferred",
     "reviewRestoreDeferred": "Restore",
     "reviewDeferredHint": "Deferred items keep their state and are not lost; they reappear after refreshing or reopening the review.",
-    "syncProjectionAnomalyCount": "overview projection notices"
+    "syncProjectionAnomalyCount": "overview projection notices",
+    "statsMenuLabel": "Reading stats",
+    "statsTitle": "Reading stats",
+    "statsLoading": "Loading…",
+    "statsRefresh": "Refresh",
+    "statsPrevYear": "Prev year",
+    "statsNextYear": "Next year",
+    "statsNoDaily": "Daily detail missing; heatmap unavailable (no fabricated data)",
+    "statsMonthlyOnly": "Monthly data only; daily heatmap not drawn per contract",
+    "statsUnknownDay": "Unknown (no daily data)",
+    "statsLegend": "Legend",
+    "statsLegendValue": "Read (darker = more)",
+    "statsLegendZero": "Zero",
+    "statsLegendUnknown": "Unknown",
+    "statsLegendFuture": "Future dates blank",
+    "statsBookTimes": "Per-book cumulative time (10 most recently synced)"
 }

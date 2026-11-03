@@ -1,0 +1,45 @@
+{
+  "name": "weread-note-sync-on-siyuan",
+  "author": "FelixJI",
+  "url": "https://github.com/FelixJI/WeRead-Note-Sync-on-Siyuan",
+  "version": "0.1.0",
+  "minAppVersion": "3.8.0",
+  "backends": [
+    "windows",
+    "linux",
+    "darwin",
+    "docker",
+    "android",
+    "ios"
+  ],
+  "frontends": [
+    "desktop",
+    "browser-desktop",
+    "desktop-window"
+  ],
+  "displayName": {
+    "default": "WeRead Note Sync",
+    "zh-CN": "微信读书笔记同步"
+  },
+  "description": {
+    "default": "Sync WeRead highlights, reviews and reading statistics into SiYuan via the official WeRead Agent API Gateway.",
+    "zh-CN": "通过微信读书官方 Agent API Gateway，将划线、想法与阅读统计同步到思源笔记。"
+  },
+  "readme": {
+    "default": "README.md"
+  },
+  "icon": "icon.png",
+  "keywords": [
+    "weread",
+    "微信读书",
+    "notes",
+    "笔记",
+    "sync",
+    "同步",
+    "highlights",
+    "划线",
+    "reading statistics",
+    "阅读统计"
+  ],
+  "disabledInPublish": true
+}

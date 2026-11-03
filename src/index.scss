@@ -1,0 +1,11 @@
+/**
+ * 插件级样式入口。
+ *
+ * 设置页全部样式位于 src/settings/settings-page.svelte 的 scoped <style> 中，
+ * 颜色一律沿用思源主题变量（var(--b3-theme-*)），不污染全局。
+ * 此文件仅保留为思源插件 css 约定入口（kernel 按 index.css 加载插件样式）。
+ */
+.weread-note-sync-root {
+    color: var(--b3-theme-on-background);
+    font-size: 14px;
+}

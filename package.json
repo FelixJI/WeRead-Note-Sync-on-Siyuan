@@ -1,0 +1,37 @@
+{
+  "name": "weread-note-sync-on-siyuan",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Reliable WeRead-to-SiYuan note synchronization plugin with stable block mapping, diff review, and reading statistics.",
+  "repository": "https://github.com/FelixJI/WeRead-Note-Sync-on-Siyuan",
+  "homepage": "https://github.com/FelixJI/WeRead-Note-Sync-on-Siyuan",
+  "author": "FelixJI",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "cross-env NODE_ENV=development vite build --watch",
+    "check": "run-s check:types check:svelte",
+    "check:types": "tsc --noEmit -p tsconfig.json",
+    "check:svelte": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "cross-env NODE_ENV=production vite build"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.0",
+    "@tsconfig/svelte": "^5.0.8",
+    "@types/node": "^26.4.0",
+    "cross-env": "^10.1.0",
+    "npm-run-all": "^4.1.5",
+    "sass": "^1.103.1",
+    "siyuan": "1.2.5",
+    "svelte": "^5.57.0",
+    "svelte-check": "^4.7.6",
+    "typescript": "^6.0.3",
+    "vite": "^8.2.4",
+    "vite-plugin-static-copy": "^4.1.1",
+    "vitest": "^3.2.0"
+  }
+}

@@ -24,6 +24,7 @@ const expectedFingerprintCache = new Map<string, string>();
 export function initReviewSession(deps: ReviewSessionDeps): void {
     engineRef = deps.engine;
     expectedLocalCache.clear();
+    expectedFingerprintCache.clear();
 }
 
 function requireEngine(): SyncEngine {

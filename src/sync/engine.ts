@@ -1278,8 +1278,11 @@ export class SyncEngine {
                 item.pendingUpdate = undefined;
                 item.pendingRemote = undefined;
                 changed = true;
-            } else if (stripped === pending.before) {
-                // 未落地：清除意图，候选保留待重议
+            } else if (
+                stripped === pending.before &&
+                this.#extractIalAttr(kramdown, "custom-wrs-src") === sourceKey
+            ) {
+                // 未落地（身份保持）：清除意图，候选保留待重议（复核随行：before 分支同样校验身份）
                 item.pendingUpdate = undefined;
                 changed = true;
             } else {

@@ -354,12 +354,11 @@ export class SyncEngine {
         // T05：统计快照写入总览 stats 槽位（独立失败，绝不影响笔记同步，AC5）
         if (this.#deps.projectOverview !== false && index.overviewDocId !== undefined) {
             try {
-                const stats = await collectStats(
-                    this.#deps.transport,
-                    this.#deps.apiKey,
-                    Math.floor(Date.now() / 1000),
-                );
-                await this.#updateStatsSlot(index.overviewDocId, stats.snapshotText, index.accountNamespace);
+                const nowSeconds = Math.floor(Date.parse(this.#now()) / 1000) || Math.floor(Date.now() / 1000);
+                const stats = await collectStats(this.#deps.transport, this.#deps.apiKey, nowSeconds);
+                // MAJOR-3：多行快照以代码栅栏单块化——规避真实内核把多块 markdown 拆块的未验证语义
+                const fenced = "```text\n" + stats.snapshotText + "\n```";
+                await this.#updateStatsSlot(index.overviewDocId, fenced, index.accountNamespace);
             } catch (e) {
                 projectionErrors += 1;
                 projectionAnomalies.push(`统计快照失败（不影响笔记同步）：${(e as Error).message}`);
@@ -1442,9 +1441,21 @@ export class SyncEngine {
         const next = `${snapshotText} {: id="${target.id}" custom-wrs-section="stats" custom-wrs-account="${ns}"}`;
         await this.#writer.updateBlockContent(next, target.id);
         const after = await this.#writer.getBlockKramdown(target.id);
-        if (after === undefined || stripIal(after) !== snapshotText.trim()) {
+        if (after === undefined || stripIal(after).trim() !== snapshotText.trim()) {
             throw new Error("stats 槽位回读校验失败");
         }
+    }
+
+    /** T05：书目摘要（统计对话框取单书累计时长的目标清单，按 generation 降序取前 N） */
+    async listBookSummaries(limit = 10): Promise<Array<{ bookId: string; title: string }>> {
+        const index = await this.#indexStore().load();
+        if (index === undefined) {
+            return [];
+        }
+        return Object.entries(index.books)
+            .sort((a, b) => (b[1].generation ?? 0) - (a[1].generation ?? 0))
+            .slice(0, limit)
+            .map(([bookId, entry]) => ({ bookId, title: entry.title ?? bookId }));
     }
 
     // ---------- 小工具 ----------

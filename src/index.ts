@@ -25,7 +25,7 @@ import { SyncEngine, AccountMismatchError } from "./sync/engine";
 import { initReviewSession } from "./review/queue";
 import { mountReviewDialog } from "./review/ui/review-dialog";
 import { createPluginPersistence, kernelCall } from "./sync/runtime";
-import { collectStats } from "./stats/service";
+import { collectStats, fetchBookProgress } from "./stats/service";
 import { validateSourceSegment } from "./sync/identity";
 import "./index.scss";
 
@@ -139,14 +139,34 @@ export default class WereadNoteSyncPlugin extends Plugin {
             return;
         }
         const transport = createKernelForwardProxyTransport(kernelForwardProxy);
+        const engine = this.#buildEngine();
         const dialog = new Dialog({ title: text.statsTitle, content: "", width: "860px", height: "70%" });
         const host = document.createElement("div");
+        // T05 审阅整改 MAJOR-2：单书累计（/book/getprogress recordReadingTime 秒）经引擎书目清单接线
+        const loadBooks = (): Promise<Array<{ title: string; totalSeconds?: number; progressPercent?: number }>> => {
+            if (engine === null) {
+                return Promise.resolve([]);
+            }
+            return engine.listBookSummaries(10).then(async (list) =>
+                Promise.all(
+                    list.map(async (b) => {
+                        try {
+                            const pr = await fetchBookProgress(transport, apiKey, b.bookId);
+                            return { title: b.title, totalSeconds: pr.totalSeconds, progressPercent: pr.progressPercent };
+                        } catch {
+                            return { title: b.title };
+                        }
+                    }),
+                ),
+            );
+        };
         const app = mount(StatsDialog, {
             target: host,
             props: {
                 i18n: text,
                 loadData: (year?: number) =>
                     collectStats(transport, apiKey, Math.floor(Date.now() / 1000), year),
+                loadBooks,
                 onClose: () => {
                     unmount(app);
                     dialog.destroy();

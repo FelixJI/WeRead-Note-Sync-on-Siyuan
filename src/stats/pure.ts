@@ -159,7 +159,7 @@ export function renderStatsSnapshot(parts: {
         `- 累计：${line(parts.overall)}`,
         parts.yearStreak !== undefined ? `- 本年最长连续：${parts.yearStreak}天` : "",
         parts.notes !== undefined ? `- ${parts.notes}` : "",
-        `> 口径：微信读书统计（含听书）；单位秒。生成于 ${parts.generatedAtIso}。`,
+        `> 口径：微信读书统计；单位秒。生成于 ${parts.generatedAtIso}。`,
     ]
         .filter((l) => l.length > 0)
         .join("\n");

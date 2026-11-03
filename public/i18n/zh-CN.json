@@ -99,5 +99,6 @@
     "statsLegendValue": "有阅读（越深越多）",
     "statsLegendZero": "零",
     "statsLegendUnknown": "未知",
-    "statsLegendFuture": "未来日期空白"
+    "statsLegendFuture": "未来日期空白",
+    "statsBookTimes": "单书累计时长（近同步前 10 本）"
 }

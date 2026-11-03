@@ -12,6 +12,8 @@ import {
 } from "../../src/stats/pure";
 import { collectStats } from "../../src/stats/service";
 import type { Transport } from "../../src/core/net/transport";
+import { SyncEngine } from "../../src/sync/engine";
+import { FakeKernel, FakeTransport, MemoryPersistence, fixture } from "../sync/engine.test";
 
 describe("T05 统计纯函数", () => {
     it("AC1：秒→X小时Y分钟；缺字段→不可用/未知", () => {
@@ -28,7 +30,7 @@ describe("T05 统计纯函数", () => {
     });
 
     it("AC2：仅月桶不伪造日值（unknown）；有日明细才 daily", () => {
-        const y = buildHeatmapYear(2025, undefined, { "1738368000": 3600 }, 1760000000); // 月桶 key=2025-02-02 起
+        const y = buildHeatmapYear(2025, undefined, { "1738368000": 3600 }, 1760000000); // 月桶 key=2025-02-01（1738368000=2025-02-01 UTC）
         expect(y.source).toBe("monthly");
         expect(y.days.every((d) => d.kind === "unknown" || d.kind === "future")).toBe(true);
         expect(y.complete).toBe(false);
@@ -67,7 +69,7 @@ describe("T05 统计纯函数", () => {
         });
         expect(text).toContain("本周：1小时 · 2天");
         expect(text).toContain("本月：未知");
-        expect(text).toContain("含听书");
+        expect(text).toContain("微信读书统计");
         expect(text).toContain("2026-11-03T00:00:00Z");
         expect(utcDateKey(0)).toBe("1970-01-01");
     });
@@ -110,6 +112,38 @@ describe("T05 统计服务", () => {
         expect(r.snapshotText).toContain("本周：2小时");
         expect(r.snapshotText).toContain("累计：未知");
         expect(r.heatmapYear.days).toHaveLength(365);
+    });
+
+    it("AC5：引擎级——统计成功写槽不影响同步 ok；统计失败只计告警（不触碰笔记状态）", async () => {
+        // 统计成功的复合 Transport（notebooks/bookmarklist/reviews 正常 + readdata 返回数值）
+        const books = fixture();
+        const transport = new FakeTransport(books);
+        const origPost = transport.post.bind(transport);
+        transport.post = async (url: string, body: unknown) => {
+            const req = body as Record<string, unknown>;
+            if (req.api_name === "/readdata/detail") {
+                return {
+                    status: 200,
+                    body: JSON.stringify({ errcode: 0, mode: req.mode, totalReadTime: 3600, readDays: 1 }),
+                    contentType: "application/json",
+                };
+            }
+            return origPost(url, body);
+        };
+        const kernel = new FakeKernel();
+        const persistence = new MemoryPersistence();
+        const engine = new SyncEngine({
+            persistence, kernel: kernel.call, transport,
+            apiKey: KEY, accountNamespace: "测试账号",
+            now: () => "2026-11-03T00:00:00Z", newOpId: () => "op-s1",
+        });
+        const r = await engine.syncRound();
+        expect(r.ok).toBe(true);
+        expect(r.projectionErrors).toBeUndefined();
+        const ov = kernel.allBlocks().find((b) => b.ial["custom-wrs-overview"] === "1")!;
+        const stats = kernel.allBlocks().find((b) => b.ial["custom-wrs-section"] === "stats")!;
+        expect(stats.markdown).toContain("本周：1小时"); // 真实数值写入（单块代码栅栏）
+        expect(stats.rootId).toBe(ov.id);
     });
 
     it("AC5：全部周期失败 → 快照全未知，不抛错", async () => {

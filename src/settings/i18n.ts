@@ -55,6 +55,7 @@ export const SETTINGS_TEXT_FALLBACK = {
     syncSkippedCount: "整书跳过（回包异常或保护模式，详见跳过原因）",
     syncProjectionAnomalyCount: "总览投影告警",
     statsMenuLabel: "阅读统计",
+    statsBookTimes: "单书累计时长（近同步前 10 本）",
     statsTitle: "阅读统计",
     statsLoading: "统计加载中…",
     statsRefresh: "刷新",

@@ -6,15 +6,24 @@
      * - 年份切换重新加载；年份提示经 title 属性（无悬浮环境亦可见文本行）。
      */
     import type { StatsResult } from "../stats/service";
+    import { formatDuration, formatProgress } from "../stats/pure";
+
+    export interface BookStatRow {
+        title: string;
+        totalSeconds?: number;
+        progressPercent?: number;
+    }
 
     interface Props {
         i18n: Record<string, string>;
         loadData: (year?: number) => Promise<StatsResult>;
+        loadBooks?: () => Promise<BookStatRow[]>;
         onClose: () => void;
     }
 
-    let { i18n, loadData, onClose }: Props = $props();
+    let { i18n, loadData, loadBooks, onClose }: Props = $props();
 
+    let books = $state<BookStatRow[]>([]);
     let loading = $state(false);
     let error = $state("");
     let result = $state<StatsResult | null>(null);
@@ -42,6 +51,11 @@
     }
 
     void load(undefined);
+    if (loadBooks !== undefined) {
+        void loadBooks().then((rows) => {
+            books = rows;
+        });
+    }
 </script>
 
 <div class="wrns-stats">
@@ -65,6 +79,17 @@
         <p class="wrns-stats-error">{error}</p>
     {/if}
 
+    {#if books.length > 0}
+        <div class="wrns-stats-books">
+            <h4 class="wrns-stats-subtitle">{i18n.statsBookTimes}</h4>
+            <ul class="wrns-stats-booklist">
+                {#each books as b}
+                    <li><span class="wrns-stats-book-title">{b.title}</span>
+                        <span class="wrns-stats-book-meta">{formatDuration(b.totalSeconds)} · {formatProgress(b.progressPercent).text}{formatProgress(b.progressPercent).finished ? " · 读完" : ""}</span></li>
+                {/each}
+            </ul>
+        </div>
+    {/if}
     {#if result !== null}
         <pre class="wrns-stats-snapshot">{result.snapshotText}</pre>
         {#if result.heatmapYear.source === "none"}
@@ -111,5 +136,10 @@
     .wrns-stats-heatmap { width: 100%; max-width: 760px; height: auto; }
     .wrns-stats-note, .wrns-stats-legend, .wrns-stats-error { margin: 0; font-size: 12px; color: var(--b3-theme-on-surface); }
     .wrns-stats-error { color: var(--b3-card-error-color, #d23f31); }
+    .wrns-stats-subtitle { margin: 4px 0 0; font-size: 13px; }
+    .wrns-stats-booklist { margin: 4px 0 0; padding: 0 0 0 18px; font-size: 13px; }
+    .wrns-stats-booklist li { margin: 2px 0; }
+    .wrns-stats-book-title { font-weight: 500; margin-right: 8px; }
+    .wrns-stats-book-meta { color: var(--b3-theme-on-surface); }
     @media (max-width: 720px) { .wrns-stats-head { flex-direction: column; align-items: stretch; } }
 </style>

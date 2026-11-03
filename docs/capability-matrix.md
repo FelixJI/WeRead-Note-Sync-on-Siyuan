@@ -59,6 +59,16 @@
 - **AC5 视觉证据**：桌面/浏览器、深浅色、窄窗截图与操作证据 UNVERIFIED-LIVE（无 GUI 环境），T06 GAC6 实测。
 - 投影时机：整轮部分失败仍投影（失败书 syncedThisRound=false 不更新其 meta）——设计契约 §4 补充说明。
 
+## T05 审阅裁决补充（2026-11-03）
+
+- **多块 updateBlock 语义**：stats 快照以代码栅栏单块化写入（规避真实内核拆块未验证行为）；栅栏内多行是否被拆为多块 UNVERIFIED-LIVE，T06 取证；FakeKernel 原样单块存储，相关测试不构成内核行为证据。
+- **dailyReadTimes/readTimes key 形态**：实现按"UTC 日起始秒字符串"精确匹配；若服务端为 CST 日界或其他形态，热力图将全 unknown（不伪造）——UNVERIFIED-LIVE，T06 以真实回包校准。
+- **readDays/totalReadTime 字段语义**：按网关契约文档实现；真实回包校准 UNVERIFIED-LIVE。
+- **含听书口径**：已从用户可见文案中删除该断言（待实测后再标注）。
+- **快照文案语言**：当前为中文（交互 UI 有双语 i18n）；英文用户混排已知限制，T06 评估。
+- **单书累计**：/book/getprogress recordReadingTime（秒）+progress（0-100）按契约实现，真实回包 UNVERIFIED-LIVE。
+- AC5 视觉证据（深浅色/窄屏截图）UNVERIFIED-LIVE → T06；统计失败独立性与四败冷却优雅降级已有引擎级测试。
+
 ## 遗留契约缺口（移交 T02 实测解决）
 
 - **账号命名空间来源**：现有官方技能契约接口（notebooks/shelf/readdata 等）均未文档化"自身份（vid）"字段。Goal 要求账号命名空间不得以 Key 哈希定义、换 Key 不自动换账号。T02 方案：取得真实 Key 后优先探测服务端身份字段（`/_list` 及全量回包未文档化字段）；若确无可用身份字段，则由用户在首次配置时显式选择/确认账号标签，并显式确认 Key↔账号变更，绝不静默推导。

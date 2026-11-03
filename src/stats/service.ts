@@ -63,9 +63,38 @@ export async function fetchReaddata(
     transport: Transport,
     apiKey: string,
     mode: "weekly" | "monthly" | "annually" | "overall",
+    baseTime?: number,
 ): Promise<ReaddataDetail> {
-    const obj = await executeGatewayCall(transport, apiKey, "/readdata/detail", { mode });
+    // 审阅整改 MAJOR-1：显式传 baseTime（契约关键参数），消除网关默认值依赖
+    const params: Record<string, unknown> = { mode };
+    if (baseTime !== undefined) {
+        params.baseTime = baseTime;
+    }
+    const obj = await executeGatewayCall(transport, apiKey, "/readdata/detail", params);
     return parseDetail(obj);
+}
+
+/** 单书累计（/book/getprogress：recordReadingTime 秒 + progress 0-100）——审阅整改 MAJOR-2 */
+export interface BookProgress {
+    bookId: string;
+    totalSeconds?: number;
+    progressPercent?: number;
+}
+
+export async function fetchBookProgress(transport: Transport, apiKey: string, bookId: string): Promise<BookProgress> {
+    const obj = await executeGatewayCall(transport, apiKey, "/book/getprogress", { bookId });
+    const book = typeof obj.book === "object" && obj.book !== null ? (obj.book as Record<string, unknown>) : {};
+    const t = typeof book.recordReadingTime === "number" && Number.isFinite(book.recordReadingTime) ? book.recordReadingTime : undefined;
+    const pr = typeof book.progress === "number" && Number.isFinite(book.progress) ? book.progress : undefined;
+    return { bookId, totalSeconds: t, progressPercent: pr };
+}
+
+/** 有界退避（审阅整改 MINOR-4）：连续整败后 10 分钟内跳过统计调用 */
+let statsCooldownUntil = 0;
+const STATS_COOLDOWN_MS = 10 * 60 * 1000;
+
+export function statsInCooldown(nowMs: number): boolean {
+    return nowMs < statsCooldownUntil;
 }
 
 /** 拉四周期 + 本年热力图 + 快照文本；任一周期失败 → 该周期 undefined（热力图仍尽力）。 */
@@ -75,22 +104,28 @@ export async function collectStats(
     nowSeconds: number,
     year?: number,
 ): Promise<StatsResult> {
-    const [weekly, monthly, annually, overall] = await Promise.all(
-        (["weekly", "monthly", "annually", "overall"] as const).map(async (mode) => {
-            try {
-                return await fetchReaddata(transport, apiKey, mode);
-            } catch {
-                return undefined;
-            }
-        }),
-    );
-    const y = year ?? new Date(nowSeconds * 1000).getUTCFullYear();
-    const heatmapYear = buildHeatmapYear(
-        y,
-        annually?.dailyReadTimes,
-        annually?.readTimes,
-        nowSeconds,
-    );
+    const nowMs = nowSeconds * 1000;
+    const inCooldown = statsInCooldown(nowMs);
+    const currentYear = new Date(nowMs).getUTCFullYear();
+    const y = year ?? currentYear;
+    // 串行拉取（MINOR-4：避免 4 并发在 429 风暴时放大请求）
+    const fetchOr = async (mode: "weekly" | "monthly" | "annually" | "overall", baseTime?: number) => {
+        try {
+            return await fetchReaddata(transport, apiKey, mode, baseTime);
+        } catch {
+            return undefined;
+        }
+    };
+    const weekly = inCooldown ? undefined : await fetchOr("weekly", nowSeconds);
+    const monthly = inCooldown ? undefined : await fetchOr("monthly", nowSeconds);
+    const overall = inCooldown ? undefined : await fetchOr("overall", 0);
+    // MAJOR-1：历史年份用该年 1 月 1 日 UTC 作 baseTime 重取；当年显式传 baseTime
+    const yearStart = Date.UTC(y, 0, 1) / 1000;
+    const annually = inCooldown ? undefined : await fetchOr("annually", yearStart);
+    let heatmapYear = buildHeatmapYear(y, annually?.dailyReadTimes, annually?.readTimes, nowSeconds);
+    if (weekly === undefined && monthly === undefined && annually === undefined && overall === undefined) {
+        statsCooldownUntil = nowMs + STATS_COOLDOWN_MS; // 四周期整败才进入冷却（有界退避）
+    }
     const snapshotText = renderStatsSnapshot({
         weekly: weekly === undefined ? undefined : { label: "本周", totalSeconds: weekly.totalReadTime, readDays: weekly.readDays },
         monthly: monthly === undefined ? undefined : { label: "本月", totalSeconds: monthly.totalReadTime, readDays: monthly.readDays },
@@ -98,7 +133,11 @@ export async function collectStats(
         overall: overall === undefined ? undefined : { label: "累计", totalSeconds: overall.totalReadTime },
         yearStreak: heatmapYear.source === "daily" ? streakDays(heatmapYear.days) : undefined,
         generatedAtIso: new Date(nowSeconds * 1000).toISOString(),
-        notes: heatmapYear.source === "none" ? "年度日明细缺失，热力图暂不可用" : undefined,
+        notes: inCooldown
+            ? "统计冷却中（近期连续失败，10 分钟后自动重试；不影响笔记同步）"
+            : heatmapYear.source === "none"
+              ? "年度日明细缺失，热力图暂不可用"
+              : undefined,
     });
     return {
         weekly,

@@ -99,5 +99,6 @@
     "statsLegendValue": "Read (darker = more)",
     "statsLegendZero": "Zero",
     "statsLegendUnknown": "Unknown",
-    "statsLegendFuture": "Future dates blank"
+    "statsLegendFuture": "Future dates blank",
+    "statsBookTimes": "Per-book cumulative time (10 most recently synced)"
 }

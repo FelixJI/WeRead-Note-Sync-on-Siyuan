@@ -147,6 +147,18 @@ export class SiyuanWriter {
         return assertBlockId(op !== undefined ? op.id : undefined, "appendBlock");
     }
 
+    /**
+     * T03 受控原位更新（唯一用户批准写入口，设计契约 §3）：
+     * markdown 必须自带 IAL（id + custom-wrs-src）以保身份；调用方负责前后校验，本方法不做重试。
+     */
+    async updateBlockContent(markdown: string, blockId: string): Promise<void> {
+        await callKernel(this.#fn, "/api/block/updateBlock", {
+            dataType: "markdown",
+            data: markdown,
+            id: blockId,
+        });
+    }
+
     /** 设置块自定义属性（custom- 命名空间）。 */
     async setBlockAttrs(blockId: string, attrs: Record<string, string>): Promise<void> {
         await callKernel(this.#fn, "/api/attr/setBlockAttrs", { id: blockId, attrs });

@@ -24,6 +24,10 @@ export interface ItemState {
     override: boolean;
     lastSeenRound: number;
     lastChangeRound?: number;
+    /** T03：待审来源变更（设计契约 §2） */
+    pendingRemote?: PendingRemote;
+    /** T03：进行中的受控更新意图（设计契约 §3） */
+    pendingUpdate?: PendingUpdate;
 }
 
 export interface PendingOp {
@@ -31,6 +35,25 @@ export interface PendingOp {
     sourceKey: string;
     payloadText: string;
     startedAt: string;
+}
+
+/** T03：待审来源变更（同步轮发现指纹变化即写入；决策后清除） */
+export interface PendingRemote {
+    renderedText: string;
+    fingerprint: string;
+    payload: Record<string, unknown>;
+    detectedAt: string;
+}
+
+/** T03：受控原位更新意图（§3 协议步骤 1 持久化；中断重入核对） */
+export interface PendingUpdate {
+    opId: string;
+    before: string;
+    after: string;
+    startedAt: string;
+    /** 决策对应的远端版本（收养时推进基线用） */
+    remoteFingerprint: string;
+    remotePayload: Record<string, unknown>;
 }
 
 export interface BookSyncState {

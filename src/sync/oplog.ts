@@ -4,7 +4,15 @@
 export interface OpLogEntry {
     opId: string;
     ts: string;
-    intent: "create-notebook" | "create-doc" | "create-block" | "set-attrs" | "adopt" | "quarantine";
+    intent:
+        | "create-notebook"
+        | "create-doc"
+        | "create-block"
+        | "set-attrs"
+        | "adopt"
+        | "quarantine"
+        | "update-block"
+        | "decision";
     sourceKey?: string;
     blockId?: string;
     payloadText?: string;

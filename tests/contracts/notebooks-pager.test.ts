@@ -33,9 +33,17 @@ function jsonBody(obj: unknown, status = 200): HttpTextResponse {
     return { status, body: JSON.stringify(obj), contentType: "application/json" };
 }
 
-// 服务端原始条目形状（snake/camel 混合按真实回包模拟）
+// 服务端原始条目形状（官方契约：title/author 嵌套在 books[].book 对象内）
 function nb(bookId: string, sort: number, extra: Record<string, unknown> = {}): Record<string, unknown> {
-    return { bookId, title: `书-${bookId}`, author: "作者", reviewCount: 1, noteCount: 2, bookmarkCount: 3, sort, ...extra };
+    return {
+        bookId,
+        book: { title: `书-${bookId}`, author: "作者" },
+        reviewCount: 1,
+        noteCount: 2,
+        bookmarkCount: 3,
+        sort,
+        ...extra,
+    };
 }
 
 function bodyAsRecord(call: RecordedCall): Record<string, unknown> {
@@ -91,8 +99,8 @@ describe("书目分页（/user/notebooks）", () => {
 
     it("同 bookId 不同载荷 → 保留首个并记 ambiguousId 异常", async () => {
         const t = scriptedTransport([
-            () => jsonBody({ errcode: 0, hasMore: 1, books: [nb("A", 100, { title: "第一版" })] }),
-            () => jsonBody({ errcode: 0, hasMore: 0, books: [nb("A", 100, { title: "第二版" }), nb("F", 90)] }),
+            () => jsonBody({ errcode: 0, hasMore: 1, books: [nb("A", 100, { book: { title: "第一版" } })] }),
+            () => jsonBody({ errcode: 0, hasMore: 0, books: [nb("A", 100, { book: { title: "第二版" } }), nb("F", 90)] }),
         ]);
         const client = createWereadClient(t, KEY);
         const result = await client.listAllNotebooks();
@@ -108,7 +116,7 @@ describe("书目分页（/user/notebooks）", () => {
                 errcode: 0,
                 hasMore: 0,
                 totalBookCount: 7,
-                books: [{ title: "没有ID的书", sort: 1 }, nb("X", 2)],
+                books: [{ book: { title: "没有ID的书" }, sort: 1 }, nb("X", 2)],
             });
         const t = scriptedTransport([pageResponse]);
         const client = createWereadClient(t, KEY);
@@ -147,5 +155,53 @@ describe("书目分页（/user/notebooks）", () => {
         const result = await client.listAllNotebooks();
         expect(result.books).toHaveLength(1);
         expect(t.calls).toHaveLength(1);
+    });
+
+    it("官方契约：title/author 从 books[].book 嵌套对象读取，不被静默丢弃（PR8[3] 防回归）", async () => {
+        const t = scriptedTransport([
+            () =>
+                jsonBody({
+                    errcode: 0,
+                    hasMore: 0,
+                    books: [{ bookId: "A", book: { title: "Book A", author: "Author A" }, sort: 100 }],
+                }),
+        ]);
+        const client = createWereadClient(t, KEY);
+        const result = await client.listAllNotebooks();
+        expect(result.anomalies).toEqual([]);
+        const entry = result.books.find((b) => b.bookId === "A");
+        expect(entry?.title).toBe("Book A");
+        expect(entry?.author).toBe("Author A");
+        // 元数据进入载荷指纹：同 ID 仅元数据不同也必须触发 ambiguousId 而非静默消失
+        expect(result.books).toHaveLength(1);
+    });
+
+    it("嵌套与平铺同时出现 → 以官方契约的嵌套 book 对象为准", async () => {
+        const t = scriptedTransport([
+            () =>
+                jsonBody({
+                    errcode: 0,
+                    hasMore: 0,
+                    books: [{ bookId: "A", book: { title: "嵌套书名" }, title: "平铺书名", sort: 1 }],
+                }),
+        ]);
+        const client = createWereadClient(t, KEY);
+        const result = await client.listAllNotebooks();
+        expect(result.books[0]?.title).toBe("嵌套书名");
+    });
+
+    it("回包仅有顶层平铺 title/author（兼容形态）→ 回退读取不丢弃", async () => {
+        const t = scriptedTransport([
+            () =>
+                jsonBody({
+                    errcode: 0,
+                    hasMore: 0,
+                    books: [{ bookId: "A", title: "平铺书名", author: "平铺作者", sort: 1 }],
+                }),
+        ]);
+        const client = createWereadClient(t, KEY);
+        const result = await client.listAllNotebooks();
+        expect(result.books[0]?.title).toBe("平铺书名");
+        expect(result.books[0]?.author).toBe("平铺作者");
     });
 });

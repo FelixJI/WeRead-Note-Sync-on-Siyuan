@@ -14,6 +14,7 @@ interface CapturedReq {
     payload: unknown;
     payloadEncoding: string;
     responseEncoding: string;
+    redirect: boolean;
 }
 
 function capturingProxy(): { reqs: CapturedReq[]; transport: Transport } {
@@ -21,7 +22,7 @@ function capturingProxy(): { reqs: CapturedReq[]; transport: Transport } {
     const forwardProxy = async (req: {
         url: string; method: string; timeout: number; contentType: string;
         headers: Record<string, string>[]; payload: unknown;
-        payloadEncoding: "json"; responseEncoding: "text";
+        payloadEncoding: "json"; responseEncoding: "text"; redirect: boolean;
     }): Promise<HttpTextResponse> => {
         reqs.push(req);
         return RESP;
@@ -51,6 +52,15 @@ describe("内核 forwardProxy Transport 适配", () => {
         expect(req.payload).toEqual(body);
         expect(req.payloadEncoding).toBe("json");
         expect(req.responseEncoding).toBe("text");
+    });
+
+    it("代理请求显式禁用重定向（redirect:false），内核不得跟随重定向绕过白名单", async () => {
+        // PR8[1]：内核 forwardProxy 默认跟随重定向，且重定向目标不过 assertWhitelistedUrl；
+        // 只有显式 redirect:false 才能让重定向失败关闭（fail closed）。
+        const { reqs, transport } = capturingProxy();
+        await transport.post(WEREAD_GATEWAY_URL, {}, {}, 1000);
+        expect(reqs).toHaveLength(1);
+        expect(reqs[0].redirect).toBe(false);
     });
 
     it("headers 对象转换为内核要求的单键对象数组", async () => {

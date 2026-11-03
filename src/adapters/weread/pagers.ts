@@ -166,8 +166,10 @@ function parseReviewItems(rawReviews: unknown): RawReviewParse {
             continue;
         }
         const entry: WereadReviewEntry = { reviewId };
-        if (typeof raw.abstract === "string") entry.abstract = raw.abstract;
-        if (typeof raw.range === "string") entry.range = raw.range;
+        // 官方契约：abstract/range 与 reviewId/star 同样嵌套在 .review 对象内
+        // （整本书评/章节点评可能缺失，属条件字段）
+        if (typeof raw.review.abstract === "string") entry.abstract = raw.review.abstract;
+        if (typeof raw.review.range === "string") entry.range = raw.review.range;
         if (typeof raw.review.star === "number" && Number.isFinite(raw.review.star)) {
             entry.star = raw.review.star;
         }

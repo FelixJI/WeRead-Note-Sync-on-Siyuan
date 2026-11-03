@@ -97,6 +97,11 @@ export function statsInCooldown(nowMs: number): boolean {
     return nowMs < statsCooldownUntil;
 }
 
+/** 测试钩子：重置冷却状态（避免模块级全局态的顺序敏感） */
+export function resetStatsCooldownForTest(): void {
+    statsCooldownUntil = 0;
+}
+
 /** 拉四周期 + 本年热力图 + 快照文本；任一周期失败 → 该周期 undefined（热力图仍尽力）。 */
 export async function collectStats(
     transport: Transport,
@@ -123,8 +128,16 @@ export async function collectStats(
     const yearStart = Date.UTC(y, 0, 1) / 1000;
     const annually = inCooldown ? undefined : await fetchOr("annually", yearStart);
     let heatmapYear = buildHeatmapYear(y, annually?.dailyReadTimes, annually?.readTimes, nowSeconds);
-    if (weekly === undefined && monthly === undefined && annually === undefined && overall === undefined) {
-        statsCooldownUntil = nowMs + STATS_COOLDOWN_MS; // 四周期整败才进入冷却（有界退避）
+    // 复核随行：!inCooldown 守卫——冷却期内不发请求（四者恒 undefined），
+    // 若无守卫每次调用都会重置冷却导致"再武装死锁"（永远无法恢复）
+    if (
+        !inCooldown &&
+        weekly === undefined &&
+        monthly === undefined &&
+        annually === undefined &&
+        overall === undefined
+    ) {
+        statsCooldownUntil = nowMs + STATS_COOLDOWN_MS; // 四周期整败才进入冷却（有界退避、可自然退出）
     }
     const snapshotText = renderStatsSnapshot({
         weekly: weekly === undefined ? undefined : { label: "本周", totalSeconds: weekly.totalReadTime, readDays: weekly.readDays },

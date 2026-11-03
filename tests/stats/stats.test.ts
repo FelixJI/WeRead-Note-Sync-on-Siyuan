@@ -10,7 +10,7 @@ import {
     streakDays,
     utcDateKey,
 } from "../../src/stats/pure";
-import { collectStats } from "../../src/stats/service";
+import { collectStats, fetchReaddata, resetStatsCooldownForTest } from "../../src/stats/service";
 import type { Transport } from "../../src/core/net/transport";
 import { SyncEngine } from "../../src/sync/engine";
 import { FakeKernel, FakeTransport, MemoryPersistence, fixture } from "../sync/engine.test";
@@ -144,6 +144,56 @@ describe("T05 统计服务", () => {
         const stats = kernel.allBlocks().find((b) => b.ial["custom-wrs-section"] === "stats")!;
         expect(stats.markdown).toContain("本周：1小时"); // 真实数值写入（单块代码栅栏）
         expect(stats.rootId).toBe(ov.id);
+    });
+
+    it("复核：baseTime 请求形态——当年=年初、历史年份=该年 1/1 UTC、overall=0", async () => {
+        const calls: Array<{ mode: string; baseTime?: number }> = [];
+        const t: Transport = {
+            async post(_url, body) {
+                void _url;
+                const req = body as Record<string, unknown>;
+                if (req.api_name === "/readdata/detail") {
+                    calls.push({ mode: String(req.mode), baseTime: typeof req.baseTime === "number" ? req.baseTime : undefined });
+                    return { status: 200, body: JSON.stringify({ errcode: 0 }), contentType: "application/json" };
+                }
+                return { status: 200, body: JSON.stringify({ errcode: -1 }), contentType: "application/json" };
+            },
+        };
+        await fetchReaddata(t, KEY, "weekly", 123456);
+        expect(calls[0]).toEqual({ mode: "weekly", baseTime: 123456 });
+        await fetchReaddata(t, KEY, "overall");
+        expect(calls[1]!.baseTime).toBeUndefined();
+        await collectStats(t, KEY, 1767225600, 2024); // 2026 当前年，请求 2024
+        const annual = calls.find((c) => c.mode === "annually");
+        expect(annual?.baseTime).toBe(Date.UTC(2024, 0, 1) / 1000);
+    });
+
+    it("复核：四败冷却——进入降级、不再发请求、10 分钟后自然退出（无再武装死锁）", async () => {
+        resetStatsCooldownForTest();
+        let requests = 0;
+        const t: Transport = {
+            async post(_url, body) {
+                void _url;
+                const req = body as Record<string, unknown>;
+                if (req.api_name === "/readdata/detail") {
+                    requests += 1;
+                    return { status: 200, body: JSON.stringify({ errcode: 1, errmsg: "失败" }), contentType: "application/json" };
+                }
+                return { status: 200, body: JSON.stringify({ errcode: 0 }), contentType: "application/json" };
+            },
+        };
+        const r1 = await collectStats(t, KEY, 1767225600);
+        expect(requests).toBe(4);
+        expect(r1.snapshotText).toContain("本周：未知");
+        // 冷却期内：零请求、优雅降级说明
+        const r2 = await collectStats(t, KEY, 1767225600 + 300); // 5 分钟后（仍在冷却）
+        expect(requests).toBe(4);
+        expect(r2.snapshotText).toContain("统计冷却中");
+        // 11 分钟后：自然退出，重新尝试（再次失败→重新进入冷却，非死锁）
+        const r3 = await collectStats(t, KEY, 1767225600 + 660);
+        expect(requests).toBe(8);
+        expect(r3.snapshotText).toContain("本周：未知");
+        resetStatsCooldownForTest();
     });
 
     it("AC5：全部周期失败 → 快照全未知，不抛错", async () => {

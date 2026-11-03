@@ -1,0 +1,8 @@
+node_modules/
+dev/
+dist/
+*.log
+.DS_Store
+Thumbs.db
+# AI Flow 运行时探针日志：仅本地证据，不入库
+.ai-flow/runtime/

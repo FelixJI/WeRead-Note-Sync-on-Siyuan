@@ -75,6 +75,8 @@ export interface SyncIndex {
     overviewDocId?: string;
     /** 书目轮转游标（T02 审阅整改 M5）：每轮从该下标开始处理，避免固定截断饥饿 */
     rotation?: number;
+    /** T06：单写入端租约（writer-guard） */
+    writer?: { writerId: string; label: string; claimedAt: number; lastSeenAt: number };
     books: Record<string, { docId?: string; title?: string; generation: number }>;
 }
 

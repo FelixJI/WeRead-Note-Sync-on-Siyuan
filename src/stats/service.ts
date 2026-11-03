@@ -3,7 +3,7 @@
  * 失败独立上报（statsError），绝不回滚/影响笔记同步（AC5）。
  */
 import type { Transport } from "../core/net/transport";
-import { executeGatewayCall } from "../adapters/weread/gateway";
+import { executeGatewayCall, UpgradeRequiredError } from "../adapters/weread/gateway";
 import {
     buildHeatmapYear,
     renderStatsSnapshot,
@@ -102,7 +102,13 @@ export function resetStatsCooldownForTest(): void {
     statsCooldownUntil = 0;
 }
 
-/** 拉四周期 + 本年热力图 + 快照文本；任一周期失败 → 该周期 undefined（热力图仍尽力）。 */
+/**
+ * 拉四周期 + 所选年热力图 + 快照文本。
+ * - 任一周期普通失败 → 该周期 undefined（热力图仍尽力）。
+ * - 回包含 upgrade_info → 立即抛 UpgradeRequiredError（契约：立即暂停，不继续剩余周期，
+ *   升级指引经调用方错误流透出：对话框 error / 引擎统计异常项）。升级非瞬时失败，不进入冷却，
+ *   以免 10 分钟冷却降级掩盖升级提示。
+ */
 export async function collectStats(
     transport: Transport,
     apiKey: string,
@@ -117,7 +123,11 @@ export async function collectStats(
     const fetchOr = async (mode: "weekly" | "monthly" | "annually" | "overall", baseTime?: number) => {
         try {
             return await fetchReaddata(transport, apiKey, mode, baseTime);
-        } catch {
+        } catch (e) {
+            // PR12[5]：upgrade_info 按契约立即暂停——不吞掉、不继续剩余周期，向上透出升级指引
+            if (e instanceof UpgradeRequiredError) {
+                throw e;
+            }
             return undefined;
         }
     };
@@ -139,12 +149,15 @@ export async function collectStats(
     ) {
         statsCooldownUntil = nowMs + STATS_COOLDOWN_MS; // 四周期整败才进入冷却（有界退避、可自然退出）
     }
+    // PR12[7]：年度总量/最长连续按所选年份标注（历史年如"2024 年"）；本周/本月保持当期标签
+    const yearLabel = y === currentYear ? "本年" : `${y} 年`;
     const snapshotText = renderStatsSnapshot({
         weekly: weekly === undefined ? undefined : { label: "本周", totalSeconds: weekly.totalReadTime, readDays: weekly.readDays },
         monthly: monthly === undefined ? undefined : { label: "本月", totalSeconds: monthly.totalReadTime, readDays: monthly.readDays },
-        annually: annually === undefined ? undefined : { label: "本年", totalSeconds: annually.totalReadTime, readDays: annually.readDays },
+        annually: annually === undefined ? undefined : { label: yearLabel, totalSeconds: annually.totalReadTime, readDays: annually.readDays },
         overall: overall === undefined ? undefined : { label: "累计", totalSeconds: overall.totalReadTime },
         yearStreak: heatmapYear.source === "daily" ? streakDays(heatmapYear.days) : undefined,
+        yearLabel,
         generatedAtIso: new Date(nowSeconds * 1000).toISOString(),
         notes: inCooldown
             ? "统计冷却中（近期连续失败，10 分钟后自动重试；不影响笔记同步）"

@@ -144,9 +144,12 @@ export function renderStatsSnapshot(parts: {
     annually?: PeriodSummary;
     overall?: PeriodSummary;
     yearStreak?: number;
+    /** 年度行与最长连续行的年份标注：默认"本年"；选历史年份时传如"2024 年"（PR12[7]） */
+    yearLabel?: string;
     generatedAtIso: string;
     notes?: string;
 }): string {
+    const yearLabel = parts.yearLabel ?? "本年";
     const line = (p: PeriodSummary | undefined): string =>
         p === undefined
             ? "未知"
@@ -155,12 +158,56 @@ export function renderStatsSnapshot(parts: {
         `**阅读时长**`,
         `- 本周：${line(parts.weekly)}`,
         `- 本月：${line(parts.monthly)}`,
-        `- 本年：${line(parts.annually)}`,
+        `- ${yearLabel}：${line(parts.annually)}`,
         `- 累计：${line(parts.overall)}`,
-        parts.yearStreak !== undefined ? `- 本年最长连续：${parts.yearStreak}天` : "",
+        parts.yearStreak !== undefined ? `- ${yearLabel}最长连续：${parts.yearStreak}天` : "",
         parts.notes !== undefined ? `- ${parts.notes}` : "",
         `> 口径：微信读书统计；单位秒。生成于 ${parts.generatedAtIso}。`,
     ]
         .filter((l) => l.length > 0)
         .join("\n");
+}
+
+// ---- 统计对话框加载状态机（PR12[9]：请求代际守卫） ----
+// 纯函数、无 IO：供 stats-dialog.svelte 使用并可脱离组件直接测试。
+// 不变量：只有最新一代（generation 最大）请求能写 result/error/loading；
+// 旧代际请求完成（无论成功/失败、先回/后回）一律整批丢弃。
+
+/** 对话框加载状态：generation=最新请求代际号（每次 begin +1，单调递增）。 */
+export interface DialogLoadState<T> {
+    generation: number;
+    loading: boolean;
+    result: T | null;
+    error: string;
+}
+
+export function initialDialogLoadState<T>(): DialogLoadState<T> {
+    return { generation: 0, loading: false, result: null, error: "" };
+}
+
+/** 开始一次新请求：代际 +1、进入 loading、清空上次 error；保留旧结果供加载期间展示。 */
+export function beginDialogLoad<T>(state: DialogLoadState<T>): DialogLoadState<T> {
+    return { ...state, generation: state.generation + 1, loading: true, error: "" };
+}
+
+export type DialogLoadOutcome<T> = { ok: true; value: T } | { ok: false; message: string };
+
+/**
+ * 请求完成回写：仅当 requestGeneration 仍是最新代际时生效。
+ * - 旧代际（期间已有更新请求发出）→ 原样返回 state：不写 result/error、不清 loading。
+ * - 最新代成功 → 落位结果并退出 loading。
+ * - 最新代失败 → 退出 loading、写 error，保留既有结果（不伪造清空）。
+ */
+export function settleDialogLoad<T>(
+    state: DialogLoadState<T>,
+    requestGeneration: number,
+    outcome: DialogLoadOutcome<T>,
+): DialogLoadState<T> {
+    if (requestGeneration !== state.generation) {
+        return state;
+    }
+    if (outcome.ok) {
+        return { generation: state.generation, loading: false, result: outcome.value, error: "" };
+    }
+    return { generation: state.generation, loading: false, result: state.result, error: outcome.message };
 }

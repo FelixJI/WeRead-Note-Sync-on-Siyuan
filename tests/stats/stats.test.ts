@@ -3,14 +3,18 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+    beginDialogLoad,
     buildHeatmapYear,
     formatDuration,
     formatProgress,
+    initialDialogLoadState,
     renderStatsSnapshot,
+    settleDialogLoad,
     streakDays,
     utcDateKey,
 } from "../../src/stats/pure";
-import { collectStats, fetchReaddata, resetStatsCooldownForTest } from "../../src/stats/service";
+import { collectStats, fetchReaddata, resetStatsCooldownForTest, statsInCooldown } from "../../src/stats/service";
+import { UpgradeRequiredError } from "../../src/adapters/weread/gateway";
 import type { Transport } from "../../src/core/net/transport";
 import { SyncEngine } from "../../src/sync/engine";
 import { FakeKernel, FakeTransport, MemoryPersistence, fixture } from "../sync/engine.test";
@@ -72,6 +76,34 @@ describe("T05 统计纯函数", () => {
         expect(text).toContain("微信读书统计");
         expect(text).toContain("2026-11-03T00:00:00Z");
         expect(utcDateKey(0)).toBe("1970-01-01");
+    });
+
+    it("PR12[7]：历史年份——年度行/连续行按所选年份标注，周/月保持当期标签", () => {
+        const text = renderStatsSnapshot({
+            weekly: { label: "本周", totalSeconds: 3600 },
+            monthly: { label: "本月", totalSeconds: 7200 },
+            annually: { label: "2024 年", totalSeconds: 360000, readDays: 40 },
+            overall: { label: "累计", totalSeconds: 3600000 },
+            yearStreak: 5,
+            yearLabel: "2024 年",
+            generatedAtIso: "2026-11-03T00:00:00Z",
+        });
+        expect(text).toContain("2024 年：100小时 · 40天");
+        expect(text).toContain("2024 年最长连续：5天");
+        expect(text).toContain("本周：1小时");
+        expect(text).toContain("本月：2小时");
+        expect(text).not.toContain("本年：");
+        expect(text).not.toContain("本年最长连续");
+    });
+
+    it("PR12[7]：默认（当年）保持「本年」标注", () => {
+        const text = renderStatsSnapshot({
+            annually: { label: "本年", totalSeconds: 3600 },
+            yearStreak: 2,
+            generatedAtIso: "2026-11-03T00:00:00Z",
+        });
+        expect(text).toContain("本年：1小时");
+        expect(text).toContain("本年最长连续：2天");
     });
 });
 
@@ -201,5 +233,181 @@ describe("T05 统计服务", () => {
         const r = await collectStats(t, KEY, 1767225600);
         expect(r.snapshotText).toContain("本周：未知");
         expect(r.heatmapYear.source).toBe("none");
+    });
+
+    it("PR12[1] 回归：年份选择只作用于 annual 请求 baseTime（历史年=该年 1/1 UTC；默认当前年显式传年初）", async () => {
+        resetStatsCooldownForTest();
+        const calls: Array<{ mode: string; baseTime?: number }> = [];
+        const t: Transport = {
+            async post(_url, body) {
+                void _url;
+                const req = body as Record<string, unknown>;
+                if (req.api_name === "/readdata/detail") {
+                    calls.push({ mode: String(req.mode), baseTime: typeof req.baseTime === "number" ? req.baseTime : undefined });
+                    return { status: 200, body: JSON.stringify({ errcode: 0, totalReadTime: 60 }), contentType: "application/json" };
+                }
+                return { status: 200, body: JSON.stringify({ errcode: -1 }), contentType: "application/json" };
+            },
+        };
+        const now = 1767225600; // 2026-01-01 UTC
+        await collectStats(t, KEY, now, 2024); // 选历史年 2024
+        const byMode = (m: string): Array<number | undefined> => calls.filter((c) => c.mode === m).map((c) => c.baseTime);
+        expect(byMode("annually")).toEqual([Date.UTC(2024, 0, 1) / 1000]);
+        expect(byMode("weekly")).toEqual([now]); // 周/月仍按当前日期（当期口径）
+        expect(byMode("monthly")).toEqual([now]);
+        expect(byMode("overall")).toEqual([0]);
+        calls.length = 0;
+        await collectStats(t, KEY, now); // 默认当前年：保持现状（显式传当年年初）
+        expect(byMode("annually")).toEqual([Date.UTC(2026, 0, 1) / 1000]);
+        resetStatsCooldownForTest();
+    });
+
+    it("PR12[4] 回归：冷却期内被跳过的调用不延长冷却截止时间", async () => {
+        resetStatsCooldownForTest();
+        let requests = 0;
+        const t: Transport = {
+            async post(_url, body) {
+                void _url;
+                const req = body as Record<string, unknown>;
+                if (req.api_name === "/readdata/detail") {
+                    requests += 1;
+                    return { status: 200, body: JSON.stringify({ errcode: 1, errmsg: "失败" }), contentType: "application/json" };
+                }
+                return { status: 200, body: JSON.stringify({ errcode: 0 }), contentType: "application/json" };
+            },
+        };
+        const t0 = 1767225600;
+        await collectStats(t, KEY, t0); // 四周期整败 → 冷却至 t0+600s
+        expect(requests).toBe(4);
+        expect(statsInCooldown((t0 + 599) * 1000)).toBe(true);
+        await collectStats(t, KEY, t0 + 300); // 冷却期内：跳过（不发请求），不得延长截止
+        expect(requests).toBe(4);
+        expect(statsInCooldown((t0 + 599) * 1000)).toBe(true);
+        expect(statsInCooldown((t0 + 601) * 1000)).toBe(false); // 原截止时间原样生效
+        resetStatsCooldownForTest();
+    });
+
+    it("PR12[5]：upgrade_info 立即暂停——仅一次请求、升级错误向上透出、不进入冷却", async () => {
+        resetStatsCooldownForTest();
+        let requests = 0;
+        const t: Transport = {
+            async post(_url, body) {
+                void _url;
+                const req = body as Record<string, unknown>;
+                if (req.api_name === "/readdata/detail") {
+                    requests += 1;
+                    return {
+                        status: 200,
+                        body: JSON.stringify({ errcode: 0, upgrade_info: { message: "请升级微信读书技能版本后重试" } }),
+                        contentType: "application/json",
+                    };
+                }
+                return { status: 200, body: JSON.stringify({ errcode: 0 }), contentType: "application/json" };
+            },
+        };
+        const p = collectStats(t, KEY, 1767225600);
+        await expect(p).rejects.toBeInstanceOf(UpgradeRequiredError);
+        await expect(p).rejects.toThrow("请升级微信读书技能版本后重试"); // 升级指引可见（对话框 error / 引擎异常项）
+        expect(requests).toBe(1); // 首个请求见 upgrade_info 即停，不再请求剩余周期
+        expect(statsInCooldown(1767225600 * 1000)).toBe(false); // 升级非瞬时失败：不得被冷却降级掩盖
+        resetStatsCooldownForTest();
+    });
+
+    it("PR12[7]：选历史年份时快照按该年标注年度与连续；周/月保持当期标签", async () => {
+        resetStatsCooldownForTest();
+        const day = Date.UTC(2024, 0, 1) / 1000;
+        const daily: Record<string, number> = { [String(day)]: 600, [String(day + 86400)]: 600 };
+        const t: Transport = {
+            async post(_url, body) {
+                void _url;
+                const req = body as Record<string, unknown>;
+                if (req.api_name === "/readdata/detail") {
+                    return {
+                        status: 200,
+                        body: JSON.stringify({
+                            errcode: 0,
+                            totalReadTime: 3600,
+                            readDays: 2,
+                            dailyReadTimes: req.mode === "annually" ? daily : undefined,
+                        }),
+                        contentType: "application/json",
+                    };
+                }
+                return { status: 200, body: JSON.stringify({ errcode: 0 }), contentType: "application/json" };
+            },
+        };
+        const r = await collectStats(t, KEY, 1767225600, 2024); // 当前 2026，选 2024
+        expect(r.heatmapYear.year).toBe(2024);
+        expect(r.snapshotText).toContain("2024 年：1小时 · 2天");
+        expect(r.snapshotText).toContain("2024 年最长连续：2天");
+        expect(r.snapshotText).toContain("本周：");
+        expect(r.snapshotText).not.toContain("本年：");
+        expect(r.snapshotText).not.toContain("本年最长连续");
+        resetStatsCooldownForTest();
+    });
+});
+
+describe("T05 统计对话框加载状态机（PR12[9]：请求代际守卫）", () => {
+    it("旧请求（历史年）晚于新请求（当前年）完成 → 丢弃旧结果，不得覆盖新结果", () => {
+        let s = initialDialogLoadState<{ year: number }>();
+        s = beginDialogLoad(s); // 历史年请求
+        const stale = s.generation;
+        s = beginDialogLoad(s); // 加载中刷新 → 当前年请求（最新代）
+        const fresh = s.generation;
+        expect(s.loading).toBe(true);
+        expect(s.error).toBe("");
+        // 新请求先完成：正常落位
+        s = settleDialogLoad(s, fresh, { ok: true, value: { year: 2026 } });
+        expect(s.loading).toBe(false);
+        expect(s.result).toEqual({ year: 2026 });
+        // 旧请求随后完成：必须整批丢弃（不得回写 2024、不得改 loading/error）
+        const before = s;
+        s = settleDialogLoad(s, stale, { ok: true, value: { year: 2024 } });
+        expect(s).toBe(before);
+        expect(s.result).toEqual({ year: 2026 });
+        expect(s.loading).toBe(false);
+    });
+
+    it("旧请求先完成 → 不得提前清 loading（新请求仍在途），也不得写入旧结果", () => {
+        let s = initialDialogLoadState<{ year: number }>();
+        s = beginDialogLoad(s); // 历史年请求（慢）
+        const stale = s.generation;
+        s = beginDialogLoad(s); // 刷新 → 当前年请求（快）
+        const fresh = s.generation;
+        s = settleDialogLoad(s, stale, { ok: true, value: { year: 2024 } }); // 旧请求先回
+        expect(s.loading).toBe(true); // 仍有一个在途请求：loading 不得被旧代际清掉
+        expect(s.result).toBeNull(); // 旧结果不得写入
+        s = settleDialogLoad(s, fresh, { ok: true, value: { year: 2026 } });
+        expect(s.loading).toBe(false);
+        expect(s.result).toEqual({ year: 2026 });
+    });
+
+    it("最新代失败 → error 可见且保留既有结果；旧代失败/成功 → 均被丢弃", () => {
+        let st = initialDialogLoadState<{ year: number }>();
+        st = beginDialogLoad(st);
+        const stale = st.generation;
+        st = beginDialogLoad(st);
+        const fresh = st.generation;
+        st = settleDialogLoad(st, fresh, { ok: false, message: "微信读书接口要求升级：请升级" });
+        expect(st.loading).toBe(false);
+        expect(st.error).toBe("微信读书接口要求升级：请升级");
+        expect(st.result).toBeNull(); // 失败不伪造结果
+        const snapshot = st;
+        st = settleDialogLoad(st, stale, { ok: false, message: "旧请求失败" });
+        expect(st).toBe(snapshot); // 旧代错误不得覆盖新代状态
+        expect(st.error).toBe("微信读书接口要求升级：请升级");
+    });
+
+    it("beginDialogLoad：清空上次 error、进入 loading、保留旧结果供展示；代际单调递增", () => {
+        let s = initialDialogLoadState<{ year: number }>();
+        expect(s).toEqual({ generation: 0, loading: false, result: null, error: "" });
+        s = { ...s, result: { year: 2025 }, error: "旧错误" };
+        s = beginDialogLoad(s);
+        expect(s.generation).toBe(1);
+        expect(s.loading).toBe(true);
+        expect(s.error).toBe("");
+        expect(s.result).toEqual({ year: 2025 }); // 加载中仍显示旧快照
+        s = beginDialogLoad(s);
+        expect(s.generation).toBe(2);
     });
 });

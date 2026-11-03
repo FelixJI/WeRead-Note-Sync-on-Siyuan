@@ -14,7 +14,6 @@ import {
     type FakeBlock,
 } from "../sync/engine.test";
 import {
-    OVERVIEW_TEXT_FALLBACK,
     formatBookEntryLabel,
     formatRecentExcerptLabel,
 } from "../../src/projections/overview";

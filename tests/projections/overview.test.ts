@@ -144,7 +144,7 @@ describe("T04 原生阅读总览投影", () => {
         const ov = docs[0]!;
         expect(ov.content).toBe("00 阅读总览");
         expect(ov.box).toBe(kernel.notebooks[0]?.id); // 位于"微信读书"笔记本
-        expect(sectionBlock(kernel, ov.id, "stats")?.markdown).toBe(OVERVIEW_TEXT_FALLBACK.statsPlaceholder);
+        expect(sectionBlock(kernel, ov.id, "stats")?.markdown).toContain("阅读时长"); // T05 起轮末填充真实快照（Fake 网关无统计→未知行）
 
         const entries1 = entryBlocks(kernel, ov.id);
         expect(entries1.length).toBe(2); // 条目数 = 书数

@@ -12,6 +12,7 @@
  * 安全约束：不输出任何日志；API Key 不进入 console/日志/诊断内容。
  */
 import { Plugin, Setting, showMessage, Menu, Dialog } from "siyuan";
+import StatsDialog from "./ui/stats-dialog.svelte";
 import { mount, unmount } from "svelte";
 import SettingsPage from "./settings/settings-page.svelte";
 import { ApiKeyStore } from "./settings/api-key-store";
@@ -24,6 +25,7 @@ import { SyncEngine, AccountMismatchError } from "./sync/engine";
 import { initReviewSession } from "./review/queue";
 import { mountReviewDialog } from "./review/ui/review-dialog";
 import { createPluginPersistence, kernelCall } from "./sync/runtime";
+import { collectStats } from "./stats/service";
 import { validateSourceSegment } from "./sync/identity";
 import "./index.scss";
 
@@ -114,6 +116,11 @@ export default class WereadNoteSyncPlugin extends Plugin {
             label: text.commandReviewChanges,
             click: () => this.#openReviewDialog(),
         });
+        menu.addItem({
+            icon: "iconChart",
+            label: text.statsMenuLabel,
+            click: () => this.#openStatsDialog(),
+        });
         menu.addSeparator();
         menu.addItem({
             icon: "iconSettings",
@@ -121,6 +128,32 @@ export default class WereadNoteSyncPlugin extends Plugin {
             click: () => this.openSetting(),
         });
         menu.open({ x: event.clientX, y: event.clientY });
+    }
+
+    #openStatsDialog(): void {
+        const text = this.#text;
+        const apiKey = this.#apiKeyStore.key;
+        if (text === null || !isValidWereadApiKey(apiKey)) {
+            showMessage(text?.syncNeedApiKey ?? "请先配置 API Key", 4000, "error");
+            this.openSetting();
+            return;
+        }
+        const transport = createKernelForwardProxyTransport(kernelForwardProxy);
+        const dialog = new Dialog({ title: text.statsTitle, content: "", width: "860px", height: "70%" });
+        const host = document.createElement("div");
+        const app = mount(StatsDialog, {
+            target: host,
+            props: {
+                i18n: text,
+                loadData: (year?: number) =>
+                    collectStats(transport, apiKey, Math.floor(Date.now() / 1000), year),
+                onClose: () => {
+                    unmount(app);
+                    dialog.destroy();
+                },
+            },
+        });
+        dialog.element.querySelector(".b3-dialog__content")?.appendChild(host);
     }
 
     #openReviewDialog(): void {

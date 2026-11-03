@@ -152,7 +152,7 @@ export function renderStatsSnapshot(parts: {
             ? "未知"
             : `${formatDuration(p.totalSeconds)}${p.readDays !== undefined ? ` · ${p.readDays}天` : ""}`;
     return [
-        `**阅读时长（含收听）**`,
+        `**阅读时长**`,
         `- 本周：${line(parts.weekly)}`,
         `- 本月：${line(parts.monthly)}`,
         `- 本年：${line(parts.annually)}`,

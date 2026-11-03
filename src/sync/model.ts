@@ -48,6 +48,8 @@ export interface SyncIndex {
     accountNamespace: string;
     keyMarker?: string;
     notebookId?: string;
+    /** 书目轮转游标（T02 审阅整改 M5）：每轮从该下标开始处理，避免固定截断饥饿 */
+    rotation?: number;
     books: Record<string, { docId?: string; title?: string; generation: number }>;
 }
 
@@ -87,7 +89,10 @@ export interface BookSourceDetail {
     bookId: string;
     highlights: NormalizedHighlight[];
     reviews: NormalizedReview[];
+    /** 拉取/分页级异常（整书门禁：非空 → 整书跳过、基线零推进） */
     anomalies: string[];
+    /** 条目级归一化错误（T02 审阅整改 m2）：跳过该条并上报，不触发整书门禁 */
+    itemErrors?: string[];
     complete: boolean;
 }
 

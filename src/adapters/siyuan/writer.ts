@@ -80,11 +80,15 @@ export class SiyuanWriter {
         this.#fn = fn;
     }
 
-    /** 创建"微信读书"笔记本，返回笔记本 ID。 */
+    /** 创建"微信读书"笔记本，返回笔记本 ID。真实内核返回 data.notebook.id（docs/API.md）。 */
     async createNotebook(name: string): Promise<string> {
         const data = await callKernel(this.#fn, "/api/notebook/createNotebook", { name });
         const rec = data as Record<string, unknown> | null;
-        const id = rec !== null && typeof rec.id === "string" ? rec.id : undefined;
+        const notebook =
+            rec !== null && typeof rec.notebook === "object" && rec.notebook !== null
+                ? (rec.notebook as Record<string, unknown>)
+                : null;
+        const id = notebook !== null && typeof notebook.id === "string" ? notebook.id : undefined;
         return assertBlockId(id, "createNotebook");
     }
 
@@ -191,10 +195,22 @@ export class SiyuanWriter {
     /** 按 custom-wrs-src 精确查块（SQL 结果仍需回读核对）。 */
     async findBlocksBySourceKey(sourceKey: string): Promise<SiyuanBlock[]> {
         // 思源 blocks.ial 是 kramdown IAL 字符串（形如 {: id="..." custom-wrs-src="..."}）。
-        // sourceKey 已由 identity 层限制安全字符集；单引号双写防 SQL 转义，双引号锚定防前缀碰撞。
-        const escaped = sourceKey.replaceAll("'", "''");
+        // likeEscape 处理 %/_/\ 通配符；单引号双写防 SQL 转义；双引号锚定防前缀碰撞。
         return this.sql(
-            `select id, parent_id, root_id, box, ial from blocks where ial like '%custom-wrs-src=\"${escaped}\"%'`,
+            `select id, parent_id, root_id, box, ial from blocks where ial like '%custom-wrs-src="${likeEscape(sourceKey)}"%' escape '\\'`,
         );
     }
+}
+
+/**
+ * SQL LIKE 上下文转义：%/_/\ 是通配符/转义符（SQLite ESCAPE '\' 语义），
+ * 身份段（账号命名空间、bookId）可能含 _ ——不转义会跨书/跨账号误匹配。
+ * 单引号双写由调用方先行处理或由此处一并处理（本函数假定输入尚未做 SQL 引号转义）。
+ */
+export function likeEscape(text: string): string {
+    return text
+        .replaceAll("\\", "\\\\")
+        .replaceAll("%", "\\%")
+        .replaceAll("_", "\\_")
+        .replaceAll("'", "''");
 }

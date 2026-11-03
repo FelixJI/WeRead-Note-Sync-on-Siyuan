@@ -40,6 +40,24 @@ function assertSegment(name: string, value: string): void {
     }
 }
 
+/** UI 输入校验用（不抛错）：返回 null=合法，否则返回中文错误提示。 */
+export function validateSourceSegment(value: string): string | null {
+    if (value.length === 0) {
+        return "不能为空";
+    }
+    if (value.includes("/")) {
+        return "不能包含 /";
+    }
+    const illegal: string[] = [];
+    for (const ch of value) {
+        if (isForbidden(ch) && !illegal.includes(ch)) illegal.push(ch);
+    }
+    if (illegal.length > 0) {
+        return `不能包含以下字符：${illegal.join(" ")}`;
+    }
+    return null;
+}
+
 export function makeSourceKey(ref: SourceRef): string {
     assertSegment("accountNamespace", ref.accountNamespace);
     assertSegment("bookId", ref.bookId);

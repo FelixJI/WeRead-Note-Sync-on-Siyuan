@@ -71,3 +71,32 @@
 ## 7. 禁止事项（实现红线）
 
 不替换已有正文；不自动删除任何块；不复活本地删除；不按文本相似性绑定身份；不支持多设备同时写入（本轮无锁设计，单客户端假设写入 T06）；不直接改 .sy/数据库；对既有块的任何 update/delete 调用不得出现在自动路径（T03 另议）。
+
+## 8. 审阅整改与主代理裁决记录（2026-11-03，独立审阅 FAIL→整改）
+
+独立只读审阅结论 FAIL（1 BLOCKER + 6 MAJOR + 6 MINOR），逐项裁决：
+
+| 项 | 裁决 | 处置 |
+| --- | --- | --- |
+| B1 createNotebook 返回形状 | 修复 | 读 data.notebook.id；FakeKernel 改为真实形状 |
+| M1 双世代 save 毁坏 .prev | 修复 | 仅当当前世代通过有效性校验才晋升 .prev（store.test.ts 证） |
+| M2 保护模式被 UI 报成功 | 修复 | 书级 error 全部计入错误消息；outcome.ok 消费 |
+| M3 LIKE 通配符未转义 | 修复 | likeEscape（%/\/\）+ escape '\' 子句；引擎全查询点覆盖；含 `_` bookId 回归测试 |
+| M4 标题找回误认领 | 修复 | 仅认领"无主且为空"的孤儿；同名有内容 → 人工处理错误，不认领不新建（回归测试） |
+| M5 每轮 5 本无轮转 | 修复 | index.rotation 轮转游标 + deferredBooks 上报（回归测试） |
+| M6 块语义 UNVERIFIED-LIVE | **接受+显式标注** | 无本地真实内核，无法冒烟；假设清单入能力矩阵；退化路径为 quarantine（安全方向）；T06 真实环境验收取证 |
+| m1 plan 缺 SQL 无归属预查 | **接受风险** | 无属性孤儿块无身份不可认领；重复内容用户可见可删；与 M6 一并标注 |
+| m2 条目错误升级整书 | 修复 | 拉取/分页级（门禁）与条目级（跳过+上报）分离（回归测试） |
+| m3 账号不一致死胡同 | 修复 | AccountMismatchError 完整指引透出；设置页即时字符集校验（validateSourceSegment） |
+| m4 store 校验过浅 | 修复 | 注入字段级 isValid（index/book 两套） |
+| m5 笔记本找回单点 | 修复 | 按账号属性全局 SQL 找回 |
+| m6 逐块审计开销 | 修复 | 单次全局前缀 SQL 批量审计；SQL 缺失回读确认（索引非唯一证据不变量保持） |
+| INFO IAL 出生内嵌 vs §4 步骤3 | **采纳偏离** | IAL 内嵌优于事后 setBlockAttrs（身份原子落地，响应丢失可恢复）；本节记录为准 |
+| INFO 重建期同 sourceKey 多块 | 修复 | rebuild 直接置 quarantined，不依赖后续 audit 纠正 |
+| INFO 死代码 | 修复 | 空分支删除；oplog 增 create-notebook intent；ItemStatus "unseen" 保留为 plan 语义标签 |
+
+**M6/m1 的 UNVERIFIED-LIVE 假设清单**（真实内核冒烟前，恢复语义按"最坏退化=quarantine 停写"设计）：
+1. 内核把创建 markdown 的尾随 IAL 绑定到所建块并写入 blocks.ial；
+2. getBlockKramdown 回读正文与渲染文本逐字一致、IAL 位于尾部（stripIal 兼容）；
+3. 内核 SQL 对 IAL/转义的行为与 SQLite LIKE+ESCAPE 语义一致；
+4. updateBlock 语义（T03 解锁前置）仍完全未验证——T02 零调用。

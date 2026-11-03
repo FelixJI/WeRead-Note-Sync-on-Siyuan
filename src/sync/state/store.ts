@@ -34,10 +34,12 @@ function isVersionedObject(v: unknown): v is Record<string, unknown> & Versioned
 export class GenerationStore<T extends Versioned> {
     readonly #persistence: StatePersistence;
     readonly #name: string;
+    readonly #isValid?: (value: unknown) => boolean;
 
-    constructor(persistence: StatePersistence, name: string) {
+    constructor(persistence: StatePersistence, name: string, isValid?: (value: unknown) => boolean) {
         this.#persistence = persistence;
         this.#name = name;
+        this.#isValid = isValid;
     }
 
     get storageName(): string {
@@ -60,17 +62,21 @@ export class GenerationStore<T extends Versioned> {
             return prev;
         }
         if ((await this.#rawExists(this.#name)) || (await this.#rawExists(`${this.#name}.prev`))) {
-            // 存储有值但两级都无法解析为带 schemaVersion 的对象 → 损坏
+            // 存储有值但两级都无法解析为有效对象 → 损坏
             throw new StateCorruptionError(this.#name);
         }
         return undefined;
     }
 
-    /** 双世代写入：当前 → .prev，新值 → 当前。任一持久化失败即抛错（调用方不得推进内存基线）。 */
+    /**
+     * 双世代写入：当前 → .prev，新值 → 当前。
+     * - 只有当前世代通过有效性校验才晋升为 .prev（防止损坏值覆盖最后有效世代）；
+     * - 任一持久化失败即抛错（调用方不得推进内存基线）。
+     */
     async save(next: T): Promise<void> {
-        if (await this.#rawExists(this.#name)) {
-            const current = await this.#persistence.load(this.#name);
-            await this.#persistence.save(`${this.#name}.prev`, current);
+        const currentValid = await this.#tryLoad(this.#name);
+        if (currentValid !== undefined) {
+            await this.#persistence.save(`${this.#name}.prev`, currentValid);
         }
         await this.#persistence.save(this.#name, next);
     }
@@ -95,6 +101,12 @@ export class GenerationStore<T extends Versioned> {
         if (raw === undefined || raw === null) {
             return undefined;
         }
-        return isVersionedObject(raw) ? (raw as unknown as T) : undefined;
+        if (!isVersionedObject(raw)) {
+            return undefined;
+        }
+        if (this.#isValid !== undefined && !this.#isValid(raw)) {
+            return undefined;
+        }
+        return raw as unknown as T;
     }
 }

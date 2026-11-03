@@ -20,8 +20,9 @@ import { createSettingsText, type SettingsText } from "./settings/i18n";
 import { createKernelForwardProxyTransport } from "./core/net/forward-proxy-transport";
 import { kernelForwardProxy } from "./adapters/siyuan/kernel";
 import { isValidWereadApiKey } from "./adapters/weread/client";
-import { SyncEngine } from "./sync/engine";
+import { SyncEngine, AccountMismatchError } from "./sync/engine";
 import { createPluginPersistence, kernelCall } from "./sync/runtime";
+import { validateSourceSegment } from "./sync/identity";
 import "./index.scss";
 
 export default class WereadNoteSyncPlugin extends Plugin {
@@ -125,6 +126,12 @@ export default class WereadNoteSyncPlugin extends Plugin {
             this.openSetting();
             return;
         }
+        const nsInvalid = validateSourceSegment(namespace);
+        if (nsInvalid !== null) {
+            showMessage(`${text.settingAccountInvalid}（${nsInvalid}）`, 5000, "error");
+            this.openSetting();
+            return;
+        }
         // 换 Key 提醒（keyMarker 只提醒，绝不自动换账号）
         const keyChanged = await this.#accountStore.noteApiKey(apiKey);
         if (keyChanged) {
@@ -153,24 +160,36 @@ export default class WereadNoteSyncPlugin extends Plugin {
             const created = outcome.books.reduce((s, b) => s + b.created, 0);
             const candidates = outcome.candidatesReport.length;
             const protectedCount = outcome.protectedReport.length;
-            const bookErrors = outcome.books.filter((b) => b.error !== undefined && !b.skipped).length;
+            const itemErrors = outcome.books.reduce((s, b) => s + b.itemErrors, 0);
+            // 书级失败含"跳过但带错误"（保护模式/来源拉取失败）——这类最需要用户干预，必须按错误上报（整改 M2）
+            const bookErrors = outcome.books.filter((b) => b.error !== undefined).length;
             const parts = [
                 `${text.syncCreatedCount}: ${created}`,
                 `${text.syncCandidateCount}: ${candidates}`,
                 `${text.syncProtectedCount}: ${protectedCount}`,
             ];
-            if (bookErrors > 0) {
+            if (itemErrors > 0) {
+                parts.push(`${text.syncItemErrorCount}: ${itemErrors}`);
+            }
+            if (outcome.deferredBooks > 0) {
+                parts.push(`${text.syncDeferredCount}: ${outcome.deferredBooks}`);
+            }
+            if (!outcome.ok || bookErrors > 0) {
                 showMessage(
                     `${text.syncDoneWithError}${parts.join("，")}，${text.syncBookErrorCount}: ${bookErrors}`,
-                    6000,
+                    7000,
                     "error",
                 );
             } else {
                 showMessage(`${text.syncDoneOk}${parts.join("，")}`, 4000, "info");
             }
         } catch (e) {
-            // 异常文本可能含上下文：仅展示通用提示（脱敏在 core 层，此处不透出原始消息）
-            void e;
+            // 账号不一致是静态指引信息（不含远端文本），必须完整透出而非通用提示（整改 m3）
+            if (e instanceof AccountMismatchError) {
+                showMessage(`${text.syncDoneWithError}${e.message}`, 8000, "error");
+                return;
+            }
+            // 其余异常文本可能含上下文：仅展示通用提示（脱敏在 core 层，此处不透出原始消息）
             showMessage(text.syncUnexpectedError, 5000, "error");
         } finally {
             this.#syncing = false;

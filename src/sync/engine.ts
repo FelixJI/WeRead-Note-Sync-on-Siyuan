@@ -1,18 +1,19 @@
 /**
- * 同步引擎（docs/design/t02-sync-core.md §3/§4/§6）。
+ * 同步引擎（docs/design/t02-sync-core.md §3/§4/§6 + 审阅整改裁决记录）。
  *
  * 核心不变量（任何改动不得破坏）：
  * 1. 只新建，不更新/不删除既有块；来源变化只产生待审候选。
  * 2. 先持久化操作意图（oplog + book state.pendingOp），再写入，回读核对后才推进基线。
  * 3. 响应丢失/中断：按 custom-wrs-src SQL 查证后收养或重试，绝不盲目重建；多块歧义隔离。
- * 4. 分页异常/anomalies 非空 → 整书/整轮跳过，不推进任何基线（T01 移交门禁）。
- * 5. 存在性以块 ID 回读为准，SQL 索引不是唯一证据；状态损坏进保护模式。
+ * 4. 拉取/分页级异常 → 整书/整轮跳过，不推进任何基线；条目级归一化错误只跳过该条（整改 m2）。
+ * 5. 存在性以块回读为准，SQL 索引不是唯一证据（批量审计中"缺失"须回读确认）；状态损坏进保护模式。
  * 6. 每书独立部分成功；unseen 永不删除；本地删除永不复活。
+ * 7. SQL LIKE 值一律经 likeEscape（%/_/\ 通配符转义，escape '\\' 子句）——防跨书/跨账号误匹配（整改 M3）。
  */
 import type { Transport } from "../core/net/transport";
 import { createWereadClient } from "../adapters/weread/client";
 import { fetchBookmarkList, listAllReviewsRaw } from "../adapters/weread/bookmarks";
-import { SiyuanWriter, type KernelCallFn } from "../adapters/siyuan/writer";
+import { SiyuanWriter, likeEscape, type KernelCallFn } from "../adapters/siyuan/writer";
 import { GenerationStore, StateCorruptionError, type StatePersistence } from "./state/store";
 import {
     fingerprintPayload,
@@ -54,6 +55,8 @@ export interface BookSyncOutcome {
     quarantined: number;
     candidates: number;
     protectedCount: number;
+    /** 条目级归一化错误数（跳过该条，不阻塞整书） */
+    itemErrors: number;
     skipped: boolean;
     skipReason?: string;
     error?: string;
@@ -66,8 +69,22 @@ export interface RoundOutcome {
     abortedReason?: string;
     protectionMode?: string;
     books: BookSyncOutcome[];
+    /** 本轮因上限未覆盖的书数（轮转游标保证下轮优先，整改 M5） */
+    deferredBooks: number;
     candidatesReport: Array<{ bookId: string; sourceKey: string; reason: string }>;
     protectedReport: Array<{ bookId: string; sourceKey: string; reason: string }>;
+}
+
+/** 账号标识与既有状态不一致（换账号须显式处理，绝不自动混入）。 */
+export class AccountMismatchError extends Error {
+    constructor(existing: string, current: string) {
+        super(
+            `账号标识与既有状态不一致（现存 "${existing}"，当前 "${current}"）。` +
+                "若确实更换了微信读书账号，请先处理旧账号的同步数据（如更换账号标识并按新书库重新导入），" +
+                "不要直接沿用旧状态混入另一账号的笔记。",
+        );
+        this.name = "AccountMismatchError";
+    }
 }
 
 const NOTEBOOK_NAME = "微信读书";
@@ -85,6 +102,35 @@ function sqlEscape(text: string): string {
     return text.replaceAll("'", "''");
 }
 
+// ---------- 状态结构校验（整改 m4：字段级，防"带 schemaVersion 的坏对象"放行） ----------
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+    return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function isValidSyncIndex(v: unknown): boolean {
+    if (!isPlainObject(v)) {
+        return false;
+    }
+    if (typeof v.accountNamespace !== "string" || v.accountNamespace.length === 0) {
+        return false;
+    }
+    return isPlainObject(v.books);
+}
+
+function isValidBookSyncState(v: unknown): boolean {
+    if (!isPlainObject(v)) {
+        return false;
+    }
+    if (typeof v.bookId !== "string" || v.bookId.length === 0) {
+        return false;
+    }
+    if (typeof v.title !== "string") {
+        return false;
+    }
+    return isPlainObject(v.items);
+}
+
 export class SyncEngine {
     readonly #deps: SyncEngineDeps;
     readonly #writer: SiyuanWriter;
@@ -94,9 +140,17 @@ export class SyncEngine {
         this.#writer = new SiyuanWriter(deps.kernel);
     }
 
+    #indexStore(): GenerationStore<SyncIndex> {
+        return new GenerationStore<SyncIndex>(this.#deps.persistence, "index", isValidSyncIndex);
+    }
+
+    #bookStore(bookId: string): GenerationStore<BookSyncState> {
+        return new GenerationStore<BookSyncState>(this.#deps.persistence, `book-${bookId}`, isValidBookSyncState);
+    }
+
     async syncRound(bookLimit: number = MAX_BOOKS_PER_ROUND): Promise<RoundOutcome> {
         const books: BookSyncOutcome[] = [];
-        const indexStore = new GenerationStore<SyncIndex>(this.#deps.persistence, "index");
+        const indexStore = this.#indexStore();
 
         let index: SyncIndex;
         try {
@@ -107,6 +161,7 @@ export class SyncEngine {
                     ok: false,
                     protectionMode: `index 双世代损坏：${e.message}，本轮停写`,
                     books,
+                    deferredBooks: 0,
                     candidatesReport: [],
                     protectedReport: [],
                 };
@@ -127,6 +182,7 @@ export class SyncEngine {
                     ok: false,
                     abortedReason: `书目分页异常，整轮中止：${(e as Error).message}`,
                     books,
+                    deferredBooks: 0,
                     candidatesReport: [],
                     protectedReport: [],
                 };
@@ -136,6 +192,7 @@ export class SyncEngine {
                     ok: false,
                     abortedReason: `鉴权失败，整轮中止：${(e as Error).message}`,
                     books,
+                    deferredBooks: 0,
                     candidatesReport: [],
                     protectedReport: [],
                 };
@@ -147,6 +204,7 @@ export class SyncEngine {
                 ok: false,
                 abortedReason: `书目概览 anomalies 非空（${notebooks.anomalies.length} 条），整轮中止`,
                 books,
+                deferredBooks: 0,
                 candidatesReport: [],
                 protectedReport: [],
             };
@@ -156,12 +214,17 @@ export class SyncEngine {
         const round = this.#nextRound(index);
         index = await this.#ensureNotebook(index, indexStore, oplog);
 
-        let processed = 0;
+        // 轮转处理（整改 M5）：从 rotation 游标起，避免固定截断导致后续书永久饥饿
+        const total = notebooks.books.length;
+        const rotation = ((index.rotation ?? 0) % (total === 0 ? 1 : total) + total) % total;
+        const picked: typeof notebooks.books = [];
+        for (let i = 0; i < total && picked.length < bookLimit; i += 1) {
+            picked.push(notebooks.books[(rotation + i) % total]!);
+        }
+        const deferredBooks = total - picked.length;
+
         let ok = true;
-        for (const entry of notebooks.books) {
-            if (processed >= bookLimit) {
-                break;
-            }
+        for (const entry of picked) {
             let bookOutcome: BookSyncOutcome;
             try {
                 bookOutcome = await this.#syncBook(
@@ -182,6 +245,7 @@ export class SyncEngine {
                     quarantined: 0,
                     candidates: 0,
                     protectedCount: 0,
+                    itemErrors: 0,
                     skipped: false,
                     candidatesReport: [],
                     protectedReport: [],
@@ -189,11 +253,15 @@ export class SyncEngine {
                 };
             }
             books.push(bookOutcome);
-            processed += 1;
             if (bookOutcome.error !== undefined) {
                 ok = false;
             }
         }
+
+        // 游标推进并持久化（哪怕本轮部分失败，轮转保证下轮覆盖未处理书）
+        const nextRotation = (rotation + picked.length) % (total === 0 ? 1 : total);
+        const rotatedIndex: SyncIndex = { ...index, rotation: nextRotation };
+        await indexStore.save(rotatedIndex);
 
         const candidatesReport: RoundOutcome["candidatesReport"] = [];
         const protectedReport: RoundOutcome["protectedReport"] = [];
@@ -205,7 +273,7 @@ export class SyncEngine {
                 protectedReport.push({ bookId: b.bookId, ...r });
             }
         }
-        return { ok, books, candidatesReport, protectedReport };
+        return { ok, books, deferredBooks, candidatesReport, protectedReport };
     }
 
     // ---------- 索引 ----------
@@ -214,9 +282,7 @@ export class SyncEngine {
         const existing = await indexStore.load();
         if (existing !== undefined) {
             if (existing.accountNamespace !== this.#deps.accountNamespace) {
-                throw new Error(
-                    `账号标识与既有状态不一致（现存 "${existing.accountNamespace}"，当前 "${this.#deps.accountNamespace}"）；换账号须显式迁移，不自动混入`,
-                );
+                throw new AccountMismatchError(existing.accountNamespace, this.#deps.accountNamespace);
             }
             return existing;
         }
@@ -232,9 +298,8 @@ export class SyncEngine {
     }
 
     async #rebuildIndexFromBlocks(): Promise<SyncIndex | undefined> {
-        const ns = sqlEscape(this.#deps.accountNamespace);
         const docs = await this.#writer.sql(
-            `select id, box, content from blocks where type='d' and ial like '%custom-wrs-account="${ns}"%'`,
+            `select id, box, content from blocks where type='d' and ial like '%custom-wrs-account="${likeEscape(this.#deps.accountNamespace)}"%' escape '\\'`,
         );
         if (docs.length === 0) {
             return undefined;
@@ -274,22 +339,20 @@ export class SyncEngine {
             if (notebooks.some((nb) => nb.id === index.notebookId)) {
                 return index;
             }
-            // 笔记本 ID 失效：按既有书籍文档的 box 找回（不重复建）
-            const anyDocId = Object.values(index.books).find((b) => b.docId !== undefined)?.docId;
-            if (anyDocId !== undefined) {
-                const rows = await this.#writer.sql(
-                    `select box from blocks where id='${anyDocId}'`,
-                );
-                const box = rows[0]?.box;
-                if (box !== undefined && box.length > 0) {
-                    const next = { ...index, notebookId: box };
-                    await indexStore.save(next);
-                    return next;
-                }
+        }
+        // 笔记本 ID 失效：按账号属性全局找回任一书籍文档的 box（整改 m5：不依赖单一 docId）
+        const found = await this.#writer.sql(
+            `select box from blocks where type='d' and ial like '%custom-wrs-account="${likeEscape(this.#deps.accountNamespace)}"%' escape '\\'`,
+        );
+        for (const row of found) {
+            if (typeof row.box === "string" && row.box.length > 0) {
+                const next = { ...index, notebookId: row.box };
+                await indexStore.save(next);
+                return next;
             }
         }
         const opId = this.#opId();
-        await oplog.append({ opId, ts: this.#now(), intent: "create-doc", status: "pending" });
+        await oplog.append({ opId, ts: this.#now(), intent: "create-notebook", status: "pending" });
         const notebookId = await this.#writer.createNotebook(NOTEBOOK_NAME);
         await oplog.complete(opId, {});
         const next = { ...index, notebookId };
@@ -307,7 +370,7 @@ export class SyncEngine {
         title: string,
         round: number,
     ): Promise<BookSyncOutcome> {
-        const store = new GenerationStore<BookSyncState>(this.#deps.persistence, `book-${bookId}`);
+        const store = this.#bookStore(bookId);
         const outcome: BookSyncOutcome = {
             bookId,
             title,
@@ -316,6 +379,7 @@ export class SyncEngine {
             quarantined: 0,
             candidates: 0,
             protectedCount: 0,
+            itemErrors: 0,
             skipped: false,
             candidatesReport: [],
             protectedReport: [],
@@ -358,7 +422,7 @@ export class SyncEngine {
             outcome.protectedCount += 1;
         }
 
-        // ---- 来源明细拉取（任一失败 → 本书跳过、状态不推进）----
+        // ---- 来源明细拉取（拉取级失败 → 本书跳过、状态不推进）----
         let detail: BookSourceDetail;
         try {
             detail = await this.#fetchDetail(bookId);
@@ -368,6 +432,7 @@ export class SyncEngine {
                 error: `来源拉取失败，本书跳过（状态未推进）：${(e as Error).message}`,
             };
         }
+        outcome.itemErrors = detail.itemErrors?.length ?? 0;
 
         // ---- 计划 ----
         const plan = computePlan({
@@ -381,21 +446,21 @@ export class SyncEngine {
             outcome.candidates += 1;
         }
         for (const p of plan.protected) {
+            if (outcome.protectedReport.some((x) => x.sourceKey === p.sourceKey && x.reason === p.reason)) {
+                continue;
+            }
             outcome.protectedReport.push({ sourceKey: p.sourceKey, reason: p.reason });
             outcome.protectedCount += 1;
         }
         if (plan.skipped) {
             return { ...outcome, skipped: true, skipReason: plan.skipReason };
         }
-        if (plan.creates.length === 0 && !plan.candidates.length && !plan.protected.length) {
-            // 无动作也要推进 seen 与世代（幂等轮）
-        }
 
         // ---- 文档确保（含丢失找回）----
         const docEnsured = await this.#ensureDoc(index, indexStore, oplog, store, state, bookId, title);
         state = docEnsured.state;
-        if (state.docId === undefined) {
-            return { ...outcome, error: "无法确定书籍文档（找回歧义或创建失败），本书跳过" };
+        if (docEnsured.error !== undefined || state.docId === undefined) {
+            return { ...outcome, error: docEnsured.error ?? "无法确定书籍文档，本书跳过" };
         }
         const docId = state.docId;
 
@@ -434,7 +499,9 @@ export class SyncEngine {
     }
 
     async #fetchDetail(bookId: string): Promise<BookSourceDetail> {
+        // 拉取/分页级异常（整书门禁）与条目级归一化错误（只跳过该条）分开收集（整改 m2）
         const anomalies: string[] = [];
+        const itemErrors: string[] = [];
         const bm = await fetchBookmarkList(this.#deps.transport, this.#deps.apiKey, bookId);
         anomalies.push(...bm.anomalies);
         const highlights: NormalizedHighlight[] = [];
@@ -443,7 +510,7 @@ export class SyncEngine {
             if (n.ok) {
                 highlights.push(n.value);
             } else {
-                anomalies.push(n.error);
+                itemErrors.push(n.error);
             }
         }
         const rv = await listAllReviewsRaw(this.#deps.transport, this.#deps.apiKey, bookId);
@@ -454,11 +521,11 @@ export class SyncEngine {
             if (n.ok) {
                 reviews.push(n.value);
             } else {
-                anomalies.push(n.error);
+                itemErrors.push(n.error);
             }
         }
         const complete = bm.complete && anomalies.length === 0;
-        return { bookId, highlights, reviews, anomalies, complete };
+        return { bookId, highlights, reviews, anomalies, itemErrors, complete };
     }
 
     // ---------- 恢复 ----------
@@ -540,7 +607,7 @@ export class SyncEngine {
         return { state: next, adopted: 1, quarantined: 0 };
     }
 
-    // ---------- 块体检 ----------
+    // ---------- 块体检（整改 m6：批量 SQL，缺失项回读确认） ----------
 
     async #auditBlocks(
         store: GenerationStore<BookSyncState>,
@@ -555,61 +622,69 @@ export class SyncEngine {
         let quarantined = 0;
         let changed = false;
 
-        for (const [key, item] of Object.entries(state.items)) {
-            if (item.status !== "active" || item.blockId === undefined) {
-                continue;
-            }
-            const kramdown = await this.#writer.getBlockKramdown(item.blockId);
-            if (kramdown === undefined) {
-                // 本地删除：永不复活（AC5）
-                item.status = "user-deleted";
-                changed = true;
-                protectedList.push({ sourceKey: key, reason: "user-deleted" });
-                continue;
-            }
-            if (state.docId !== undefined) {
-                const info = await this.#writer.getBlockInfo(item.blockId);
-                if (info?.rootId !== undefined && info.rootId !== state.docId) {
+        if (state.docId !== undefined) {
+            // 一次全局前缀查询取本书全部条目块（不限 root——moved-out 块的 root 已不在本文档）：
+            // id/root_id/markdown/ial。SQL 缺失的条目回读确认（存在性以块回读为准，索引非唯一证据）。
+            const rows = await this.#writer.sql(
+                `select id, root_id, markdown, ial from blocks where ial like '%custom-wrs-src="${likeEscape(this.#deps.accountNamespace)}/${likeEscape(bookId)}/%' escape '\\' and type != 'd'`,
+            );
+            const byBlockId = new Map(rows.map((r) => [r.id, r]));
+            for (const [key, item] of Object.entries(state.items)) {
+                if (item.status !== "active" || item.blockId === undefined) {
+                    continue;
+                }
+                const row = byBlockId.get(item.blockId);
+                if (row === undefined) {
+                    // SQL 缺失不直接判死（索引可能滞后）：回读确认
+                    const kramdown = await this.#writer.getBlockKramdown(item.blockId);
+                    if (kramdown === undefined) {
+                        // 本地删除：永不复活（AC5）
+                        item.status = "user-deleted";
+                        changed = true;
+                        protectedList.push({ sourceKey: key, reason: "user-deleted" });
+                    }
+                    // 回读存在：索引滞后，保持 active，不动
+                    continue;
+                }
+                if (row.root_id !== undefined && row.root_id !== state.docId) {
                     // 移出管理范围：暂停写入，不补建（AC2）
                     item.status = "moved-out";
                     changed = true;
                     protectedList.push({ sourceKey: key, reason: "moved-out" });
                     continue;
                 }
-            }
-            // 本地基线漂移 → override 标记（不覆盖、不更新，报告上层；T03 处理）
-            if (item.localBaseline !== undefined && stripIal(kramdown) !== item.localBaseline) {
-                item.override = true;
-                changed = true;
-                protectedList.push({ sourceKey: key, reason: "local-modified" });
-            }
-        }
-
-        // 属性歧义扫描（AC4：复制属性 → 隔离，禁止任选接管）
-        const ns = sqlEscape(this.#deps.accountNamespace);
-        const bid = sqlEscape(bookId);
-        const blocks = await this.#writer.sql(
-            `select id, ial from blocks where ial like '%custom-wrs-src="${ns}/${bid}/%' and type != 'd'`,
-        );
-        const byKey = new Map<string, string[]>();
-        for (const b of blocks) {
-            const src = this.#extractIalAttr(b.ial ?? "", "custom-wrs-src");
-            if (src === undefined) {
-                continue;
-            }
-            const list = byKey.get(src) ?? [];
-            list.push(b.id);
-            byKey.set(src, list);
-        }
-        for (const [src, ids] of byKey) {
-            if (ids.length > 1) {
-                const item = state.items[src];
-                if (item !== undefined && item.status === "active") {
-                    item.status = "quarantined";
-                    item.blockId = ids[0];
+                // 本地基线漂移 → override 标记（不覆盖、不更新，报告上层；T03 处理）
+                if (
+                    item.localBaseline !== undefined &&
+                    row.markdown !== undefined &&
+                    stripIal(row.markdown) !== item.localBaseline
+                ) {
+                    item.override = true;
                     changed = true;
-                    quarantined += 1;
-                    protectedList.push({ sourceKey: src, reason: "ambiguous-attrs" });
+                    protectedList.push({ sourceKey: key, reason: "local-modified" });
+                }
+            }
+            // 属性歧义（复制属性 → 隔离，禁止任选接管）：同一查询内按 sourceKey 分组
+            const bySrc = new Map<string, string[]>();
+            for (const r of rows) {
+                const src = this.#extractIalAttr(r.ial ?? "", "custom-wrs-src");
+                if (src === undefined) {
+                    continue;
+                }
+                const list = bySrc.get(src) ?? [];
+                list.push(r.id);
+                bySrc.set(src, list);
+            }
+            for (const [src, ids] of bySrc) {
+                if (ids.length > 1) {
+                    const item = state.items[src];
+                    if (item !== undefined && item.status === "active") {
+                        item.status = "quarantined";
+                        item.blockId = ids[0];
+                        changed = true;
+                        quarantined += 1;
+                        protectedList.push({ sourceKey: src, reason: "ambiguous-attrs" });
+                    }
                 }
             }
         }
@@ -630,7 +705,7 @@ export class SyncEngine {
         state: BookSyncState,
         bookId: string,
         title: string,
-    ): Promise<{ state: BookSyncState }> {
+    ): Promise<{ state: BookSyncState; error?: string }> {
         if (state.docId !== undefined) {
             const kramdown = await this.#writer.getBlockKramdown(state.docId);
             if (kramdown !== undefined) {
@@ -638,9 +713,8 @@ export class SyncEngine {
             }
             // 文档 ID 失效：按属性找回（不盲目重建）
         }
-        const ns = sqlEscape(this.#deps.accountNamespace);
         const docs = await this.#writer.sql(
-            `select id from blocks where type='d' and ial like '%custom-wrs-book-id="${sqlEscape(bookId)}"%' and ial like '%custom-wrs-account="${ns}"%'`,
+            `select id from blocks where type='d' and ial like '%custom-wrs-book-id="${likeEscape(bookId)}"%' escape '\\' and ial like '%custom-wrs-account="${likeEscape(this.#deps.accountNamespace)}"%' escape '\\'`,
         );
         if (docs.length === 1) {
             const next = { ...state, docId: docs[0].id };
@@ -648,27 +722,36 @@ export class SyncEngine {
             return { state: next };
         }
         if (docs.length > 1) {
-            return { state }; // 歧义：不选边，交上层报错
+            return { state, error: "发现多份同身份书籍文档（属性歧义），需人工裁决后重试" };
         }
-        // 文档创建窗口兜底：属性未落的同名孤儿文档（创建后、setBlockAttrs 前中断）按标题找回。
-        // 必须排除任何已绑定 custom-wrs-book-id 的文档——同名书按 bookId 区分，不得误认领。
+        // 文档创建窗口兜底（整改 M4：仅认领"空且无主"的孤儿文档）：
+        // 非空的同名文档视为用户文档冲突——不认领、不新建，交人工处理
         if (index.notebookId !== undefined) {
             const sanitized = sanitizeDocTitle(title, bookId);
             const byTitle = await this.#writer.sql(
-                `select id, box from blocks where type='d' and content='${sqlEscape(sanitized)}' and box='${sqlEscape(index.notebookId)}' and ial not like '%custom-wrs-book-id=%'`,
+                `select id from blocks where type='d' and content='${sqlEscape(sanitized)}' and box='${sqlEscape(index.notebookId)}' and ial not like '%custom-wrs-book-id=%'`,
             );
+            if (byTitle.length > 1) {
+                return { state, error: `存在 ${byTitle.length} 份同名未绑定文档，歧义需人工裁决` };
+            }
             if (byTitle.length === 1) {
-                const adoptedId = byTitle[0].id;
-                await this.#writer.setBlockAttrs(adoptedId, {
+                const candidateId = byTitle[0].id;
+                const children = await this.#writer.sql(
+                    `select id from blocks where root_id='${sqlEscape(candidateId)}'`,
+                );
+                if (children.length > 0) {
+                    return {
+                        state,
+                        error: `已存在同名文档《${sanitized}》且含内容，为避免误碰用户文档未自动认领；请人工处理后再同步`,
+                    };
+                }
+                await this.#writer.setBlockAttrs(candidateId, {
                     "custom-wrs-book-id": bookId,
                     "custom-wrs-account": this.#deps.accountNamespace,
                 });
-                const next = { ...state, docId: adoptedId };
+                const next = { ...state, docId: candidateId };
                 await store.save(next);
                 return { state: next };
-            }
-            if (byTitle.length > 1) {
-                return { state }; // 同名歧义：不选边
             }
         }
         const opId = this.#opId();
@@ -726,10 +809,8 @@ export class SyncEngine {
             let anchorId: string | undefined;
             if (create.kind === "highlight" && create.chapter !== undefined) {
                 // 章节标题去重：同文档同内容标题已存在则不重复插入（blocks.content 为纯文本）
-                const docSql = sqlEscape(docId);
-                const headingSql = sqlEscape(create.chapter.title);
                 const existing = await this.#writer.sql(
-                    `select id from blocks where root_id='${docSql}' and type='h' and content='${headingSql}'`,
+                    `select id from blocks where root_id='${sqlEscape(docId)}' and type='h' and content='${sqlEscape(create.chapter.title)}'`,
                 );
                 if (existing.length === 0) {
                     anchorId = await this.#writer.appendChildBlock(
@@ -740,9 +821,8 @@ export class SyncEngine {
             }
             if (create.kind === "review" && create.matchedHighlightBlockHint === undefined) {
                 // 独立想法：懒建"想法"区标题
-                const docSql = sqlEscape(docId);
                 const existing = await this.#writer.sql(
-                    `select id from blocks where root_id='${docSql}' and type='h' and content='${sqlEscape(REVIEW_SECTION_TEXT)}'`,
+                    `select id from blocks where root_id='${sqlEscape(docId)}' and type='h' and content='${sqlEscape(REVIEW_SECTION_TEXT)}'`,
                 );
                 if (existing.length === 0) {
                     await this.#writer.appendChildBlock(renderReviewSectionHeading(), docId);
@@ -809,21 +889,25 @@ export class SyncEngine {
         index: SyncIndex,
     ): Promise<BookSyncState> {
         // 基线丢失：从块属性重建身份映射；指纹置 unknown → 后续轮来源比对只产生候选，绝不覆盖、不重复导入
-        const ns = sqlEscape(this.#deps.accountNamespace);
-        const bid = sqlEscape(bookId);
         const blocks = await this.#writer.sql(
-            `select id, ial, markdown from blocks where ial like '%custom-wrs-src="${ns}/${bid}/%'`,
+            `select id, ial, markdown from blocks where ial like '%custom-wrs-src="${likeEscape(this.#deps.accountNamespace)}/${likeEscape(bookId)}/%' escape '\\'`,
         );
         const items: Record<string, ItemState> = {};
         for (const b of blocks) {
             const src = this.#extractIalAttr(b.ial ?? "", "custom-wrs-src");
-            if (src === undefined || items[src] !== undefined) {
+            if (src === undefined) {
+                continue;
+            }
+            const existing = items[src];
+            if (existing !== undefined) {
+                // 重建期同 sourceKey 多块：直接隔离，不"任选一个"（整改 INFO）
+                existing.status = "quarantined";
                 continue;
             }
             items[src] = {
                 kind: this.#kindOf(src),
                 sourcePayload: {},
-                renderedText: b.markdown ?? "",
+                renderedText: b.markdown !== undefined ? stripIal(b.markdown) : "",
                 localBaseline: b.markdown !== undefined ? stripIal(b.markdown) : undefined,
                 versionFingerprint: "rebuilt-unknown",
                 status: "active",

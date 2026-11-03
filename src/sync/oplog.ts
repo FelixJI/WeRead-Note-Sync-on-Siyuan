@@ -4,7 +4,7 @@
 export interface OpLogEntry {
     opId: string;
     ts: string;
-    intent: "create-doc" | "create-block" | "set-attrs" | "adopt" | "quarantine";
+    intent: "create-notebook" | "create-doc" | "create-block" | "set-attrs" | "adopt" | "quarantine";
     sourceKey?: string;
     blockId?: string;
     payloadText?: string;

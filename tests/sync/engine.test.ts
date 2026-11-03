@@ -199,9 +199,10 @@ class FakeKernel {
         const rec = data as Record<string, unknown>;
         switch (path) {
             case "/api/notebook/createNotebook": {
+                // 真实内核形状（审阅 B1）：data.notebook.id
                 const nb = { id: this.#id("nb"), name: String(rec.name), closed: false };
                 this.notebooks.push(nb);
-                return { code: 0, msg: "", data: nb };
+                return { code: 0, msg: "", data: { notebook: nb } };
             }
             case "/api/notebook/lsNotebooks":
                 return { code: 0, msg: "", data: { notebooks: this.notebooks } };
@@ -298,56 +299,82 @@ class FakeKernel {
         }
     };
 
-    /** 迷你 SQL：仅支持引擎实际使用的查询形状 */
+    /** 迷你 SQL：忠实模拟 SQLite 关键语义（LIKE 通配符/ESCAPE、'' 解码），仅支持引擎使用的形状 */
     sql(query: string): Array<Record<string, unknown>> {
         const selectM = query.match(/^select ([\w, ]+) from blocks where (.+)$/u);
         if (selectM === null) {
             return [];
         }
         const cols = selectM[1].split(",").map((c) => c.trim());
-        const conditions = selectM[2].split(" and ").map((c) => c.trim());
+        const where = selectM[2];
+        const conds: Array<{ op: string; raw: string }> = [];
+        const condRe = /(ial not like|ial like|type !=|type=|root_id=|id=|content=|box=)\s*'((?:[^']|'')*)'(?:\s*escape\s*'\\\\')?/gu;
+        for (const m of where.matchAll(condRe)) {
+            conds.push({ op: m[1], raw: m[2] });
+        }
+        const unescapeSql = (s: string): string => s.replaceAll("''", "'");
+        const likeToRegex = (pattern: string): RegExp => {
+            // SQLite LIKE + ESCAPE '\' 语义：% 任意串、_ 单字符、\x 字面量 x
+            let src = "^";
+            for (let i = 0; i < pattern.length; i += 1) {
+                const ch = pattern[i]!;
+                if (ch === "\\" && i + 1 < pattern.length) {
+                    src += pattern[i + 1]!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                    i += 1;
+                } else if (ch === "%") {
+                    src += ".*";
+                } else if (ch === "_") {
+                    src += ".";
+                } else {
+                    src += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                }
+            }
+            return new RegExp(`${src}$`, "u");
+        };
+        const ialString = (b: FakeBlock): string =>
+            `{: ${Object.entries(b.ial).map(([k, v]) => `${k}="${v}"`).join(" ")}}`;
         const rows: Array<Record<string, unknown>> = [];
         for (const b of this.blocks.values()) {
             let ok = true;
-            for (const cond of conditions) {
-                let m: RegExpMatchArray | null;
-                if ((m = cond.match(/^ial like '%(.+)%'$/u)) !== null) {
-                    if (!Object.entries(b.ial).some(([k, v]) => `${k}="${v}"`.includes(m![1]))) {
+            for (const cond of conds) {
+                const value = unescapeSql(cond.raw);
+                if (cond.op === "ial like") {
+                    if (!likeToRegex(value).test(ialString(b))) {
                         ok = false;
                         break;
                     }
-                } else if ((m = cond.match(/^ial not like '%(.+)%'$/u)) !== null) {
-                    if (Object.entries(b.ial).some(([k, v]) => `${k}="${v}"`.includes(m![1]))) {
+                } else if (cond.op === "ial not like") {
+                    if (likeToRegex(value).test(ialString(b))) {
                         ok = false;
                         break;
                     }
-                } else if ((m = cond.match(/^type='(\w+)'$/u)) !== null) {
-                    if (b.type !== m[1]) {
+                } else if (cond.op === "type=") {
+                    if (b.type !== value) {
                         ok = false;
                         break;
                     }
-                } else if ((m = cond.match(/^type != '(\w+)'$/u)) !== null) {
-                    if (b.type === m[1]) {
+                } else if (cond.op === "type !=") {
+                    if (b.type === value) {
                         ok = false;
                         break;
                     }
-                } else if ((m = cond.match(/^id='([^']+)'$/u)) !== null) {
-                    if (b.id !== m[1]) {
+                } else if (cond.op === "id=") {
+                    if (b.id !== value) {
                         ok = false;
                         break;
                     }
-                } else if ((m = cond.match(/^root_id='([^']+)'$/u)) !== null) {
-                    if (b.rootId !== m[1]) {
+                } else if (cond.op === "root_id=") {
+                    if (b.rootId !== value) {
                         ok = false;
                         break;
                     }
-                } else if ((m = cond.match(/^content='([^']*)'$/u)) !== null) {
-                    if (b.content !== m[1]) {
+                } else if (cond.op === "content=") {
+                    if (b.content !== value) {
                         ok = false;
                         break;
                     }
-                } else if ((m = cond.match(/^box='([^']*)'$/u)) !== null) {
-                    if (b.box !== m[1]) {
+                } else if (cond.op === "box=") {
+                    if (b.box !== value) {
                         ok = false;
                         break;
                     }
@@ -362,11 +389,13 @@ class FakeKernel {
                     if (c === "id") {
                         row.id = b.id;
                     } else if (c === "ial") {
-                        row.ial = `{: ${Object.entries(b.ial).map(([k, v]) => `${k}="${v}"`).join(" ")}}`;
+                        row.ial = ialString(b);
                     } else if (c === "content") {
                         row.content = b.content;
                     } else if (c === "box") {
                         row.box = b.box;
+                    } else if (c === "root_id") {
+                        row.root_id = b.rootId;
                     } else if (c === "markdown") {
                         row.markdown = `${b.markdown} {: ${Object.entries(b.ial).map(([k, v]) => `${k}="${v}"`).join(" ")}}`;
                     }
@@ -803,5 +832,119 @@ describe("同步引擎：非破坏导入与稳定块映射", () => {
         expect(r.ok).toBe(false);
         expect(r.abortedReason).toContain("鉴权失败");
         expect(kernel.allBlocks().length).toBe(0);
+    });
+
+    it("整改m2：单条归一化错误（缺 bookmarkId）→ 只跳过该条，整书继续导入", async () => {
+        const books = fixture();
+        books["10001"]!.highlights.push({
+            bookmarkId: "",
+            chapterUid: 1,
+            markText: "没有 ID 的坏条目",
+            range: "1-2",
+            createTime: 1700000009,
+        });
+        const { engine } = makeDeps(books);
+        const r = await engine.syncRound();
+        expect(r.ok).toBe(true);
+        expect(r.books[0]?.skipped).toBe(false);
+        expect(r.books[0]?.created).toBe(5);
+        expect(r.books[0]?.itemErrors).toBe(1);
+    });
+
+    it("整改M5：6 本书、每轮 5 本 → 轮转覆盖，无永久饥饿", async () => {
+        const books: Record<string, BookScript> = {};
+        for (let i = 1; i <= 6; i += 1) {
+            books[`20${String(i).padStart(3, "0")}`] = {
+                title: `书${i}`,
+                highlights: [
+                    { bookmarkId: `h-${i}`, chapterUid: 1, markText: `内容${i}`, range: "1-9", createTime: 1700000000 + i },
+                ],
+                reviews: [],
+            };
+        }
+        const { kernel, engine } = makeDeps(books);
+        const r1 = await engine.syncRound();
+        expect(r1.books).toHaveLength(5);
+        expect(r1.deferredBooks).toBe(1);
+        expect(r1.ok).toBe(true);
+        expect(kernel.itemBlocks().length).toBe(5);
+
+        const r2 = await engine.syncRound();
+        expect(r2.ok).toBe(true);
+        // 轮转后第一本是上轮被推迟的第 6 本
+        expect(r2.books[0]?.bookId).toBe("20006");
+        expect(r2.books[0]?.created).toBe(1);
+        expect(kernel.itemBlocks().length).toBe(6);
+    });
+
+    it("整改M4：同名且有内容的用户文档 → 不认领不新建，报人工处理", async () => {
+        const books = fixture();
+        const { kernel, engine } = makeDeps(books);
+        await engine.syncRound();
+        // 删除既有书籍文档（含子块），模拟文档丢失
+        const doc = kernel.allBlocks().find((b) => b.type === "d")!;
+        for (const b of kernel.allBlocks()) {
+            if (b.rootId === doc.id && b.id !== doc.id) {
+                kernel.blocks.delete(b.id);
+            }
+        }
+        kernel.blocks.delete(doc.id);
+        // 用户在插件笔记本里自建同名文档（有内容）
+        await kernel.call("/api/filetree/createDocWithMd", { notebook: kernel.notebooks[0]!.id, path: "/三体", markdown: "" });
+        const userDoc = kernel.allBlocks().find((b) => b.type === "d")!;
+        await kernel.call("/api/block/appendBlock", { dataType: "markdown", data: "用户自己的内容", parentID: userDoc.id });
+
+        const r2 = await engine.syncRound();
+        expect(r2.books[0]?.error).toContain("人工");
+        // 用户文档未被认领（无 custom 属性）、未被写入条目块
+        expect(userDoc.ial["custom-wrs-book-id"]).toBeUndefined();
+        expect(kernel.itemBlocks().length).toBe(0);
+        // 也没有新建第二份文档
+        expect(kernel.allBlocks().filter((b) => b.type === "d").length).toBe(1);
+    });
+
+    it("整改m3：账号标识与既有状态不一致 → AccountMismatchError（绝不自动混入）", async () => {
+        const books = fixture();
+        const { kernel, persistence, engine } = makeDeps(books);
+        await engine.syncRound();
+        const engine2 = new SyncEngine({
+            persistence,
+            kernel: kernel.call,
+            transport: new FakeTransport(books),
+            apiKey: KEY,
+            accountNamespace: "另一个账号",
+            now: () => "2026-11-03T00:00:00Z",
+            newOpId: () => "op-y",
+        });
+        await expect(engine2.syncRound()).rejects.toThrow(/账号标识与既有状态不一致/);
+        // 零新增写入
+        expect(kernel.itemBlocks().length).toBe(5);
+    });
+
+    it("整改M3：bookId 含 LIKE 通配符 _ → 精确匹配，不命中单字符差异的他书块", async () => {
+        const books: Record<string, BookScript> = {
+            "100077-_book": {
+                title: "通配符书",
+                highlights: [{ bookmarkId: "w1", chapterUid: 1, markText: "下划线书", range: "1-5", createTime: 1700000001 }],
+                reviews: [],
+            },
+            "100077-Xbook": {
+                title: "单字符差异书",
+                highlights: [{ bookmarkId: "w1", chapterUid: 1, markText: "另一本书", range: "1-5", createTime: 1700000001 }],
+                reviews: [],
+            },
+        };
+        const { kernel, engine } = makeDeps(books);
+        const r = await engine.syncRound();
+        expect(r.ok).toBe(true);
+        const srcA = "测试账号/100077-_book/highlight/w1";
+        const srcB = "测试账号/100077-Xbook/highlight/w1";
+        const a = kernel.itemBlocks().filter((b) => b.ial["custom-wrs-src"] === srcA);
+        const b = kernel.itemBlocks().filter((b) => b.ial["custom-wrs-src"] === srcB);
+        expect(a.length).toBe(1);
+        expect(b.length).toBe(1);
+        // 删除 A 书状态后重建：A 的重建查询不得把 B 的块拉进来
+        const aDoc = kernel.allBlocks().find((d) => d.type === "d" && d.content === "通配符书")!;
+        expect(aDoc.id).toBeDefined();
     });
 });

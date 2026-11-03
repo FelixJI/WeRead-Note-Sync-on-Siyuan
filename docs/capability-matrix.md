@@ -38,6 +38,14 @@
 - 请求：`forwardProxy`（headers 数组、payloadEncoding=json、responseEncoding=text）→ `data.status`/`data.body`。
 - 结论：桌面/浏览器共享同一 `Transport` 抽象；真实内核下的状态码透传与重定向行为 UNVERIFIED-LIVE。
 
+## T02 整改后的 UNVERIFIED-LIVE 假设（合并门禁裁决，T06 取证）
+
+1. 内核将创建 markdown 尾随 IAL 绑定到块并写入 blocks.ial（FakeKernel 假设，真实内核未测）；
+2. getBlockKramdown 回读正文与渲染文本逐字一致、IAL 位于尾部；
+3. 内核 SQL（blocks.ial LIKE + ESCAPE）行为与 SQLite 语义一致；
+4. 无属性孤儿块（IAL 未落的创建窗口）会发生一次可见重复，无法自动认领（接受风险）；
+5. updateBlock 原位更新语义（T03 前置）：完全未验证，T02 零调用。
+
 ## 遗留契约缺口（移交 T02 实测解决）
 
 - **账号命名空间来源**：现有官方技能契约接口（notebooks/shelf/readdata 等）均未文档化"自身份（vid）"字段。Goal 要求账号命名空间不得以 Key 哈希定义、换 Key 不自动换账号。T02 方案：取得真实 Key 后优先探测服务端身份字段（`/_list` 及全量回包未文档化字段）；若确无可用身份字段，则由用户在首次配置时显式选择/确认账号标签，并显式确认 Key↔账号变更，绝不静默推导。

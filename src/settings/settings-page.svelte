@@ -11,6 +11,7 @@
     import { runConnectionTest, type ConnectionFailKind, type ConnectionTestOutcome } from "./connection";
     import type { ApiKeyStore } from "./api-key-store";
     import type { AccountStore } from "./account-store";
+    import { validateSourceSegment } from "../sync/identity";
     import type { SettingsText, SettingsTextKey } from "./i18n";
 
     interface Props {
@@ -63,6 +64,9 @@
             account.setNamespace(namespace);
         }
     }
+
+    // 账号标识字符集即时校验（整改 m3：与 sourceKey 安全字符集一致，非法输入当场提示）
+    const namespaceError: string | null = $derived(validateSourceSegment(namespace.trim()));
 
     function onToggleKeyVisible(): void {
         keyVisible = !keyVisible;
@@ -143,6 +147,9 @@
             spellcheck="false"
             oninput={onNamespaceInput}
         />
+        {#if namespace.length > 0 && namespaceError !== null}
+            <p class="wrns-result-fail">{i18n.settingAccountInvalid}：{namespaceError}</p>
+        {/if}
         <p class="wrns-hint">{i18n.settingAccountHint}</p>
     </div>
 

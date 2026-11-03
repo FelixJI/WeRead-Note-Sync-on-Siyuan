@@ -39,5 +39,8 @@
     "syncCandidateCount": "pending reviews",
     "syncProtectedCount": "protected items",
     "syncBookErrorCount": "books failed",
-    "syncUnexpectedError": "Unexpected error during sync, please retry."
+    "syncUnexpectedError": "Unexpected error during sync, please retry.",
+    "settingAccountInvalid": "Account label contains unsupported characters",
+    "syncItemErrorCount": "malformed items skipped",
+    "syncDeferredCount": "books deferred to next round (rotation)"
 }

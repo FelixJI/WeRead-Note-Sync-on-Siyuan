@@ -37,6 +37,7 @@ export const SETTINGS_TEXT_FALLBACK = {
     settingAccountPlaceholder: "例如：我的微信读书主账号",
     settingAccountHint:
         "用于区分不同微信读书账号的笔记身份（参与内容绑定）。请自行命名并记住；更换 API Key 不会自动更换账号，若确实换了账号，请显式修改此标识。",
+    settingAccountInvalid: "账号标识包含不支持的字符",
     commandSyncNow: "立即同步",
     syncNeedApiKey: "请先在设置中填写有效的微信读书 API Key。",
     syncNeedAccount: "请先在设置中填写账号标识（区分不同微信读书账号）。",
@@ -48,6 +49,8 @@ export const SETTINGS_TEXT_FALLBACK = {
     syncCandidateCount: "待审变更",
     syncProtectedCount: "受保护项",
     syncBookErrorCount: "出错书籍",
+    syncItemErrorCount: "跳过的异常条目",
+    syncDeferredCount: "本轮未覆盖书籍（下轮轮转继续）",
     syncUnexpectedError: "同步出现未预期的错误，请重试。",
 } as const;
 

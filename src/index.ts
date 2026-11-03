@@ -163,6 +163,7 @@ export default class WereadNoteSyncPlugin extends Plugin {
             const itemErrors = outcome.books.reduce((s, b) => s + b.itemErrors, 0);
             // 书级失败含"跳过但带错误"（保护模式/来源拉取失败）——这类最需要用户干预，必须按错误上报（整改 M2）
             const bookErrors = outcome.books.filter((b) => b.error !== undefined).length;
+            const skippedBooks = outcome.books.filter((b) => b.skipped).length;
             const parts = [
                 `${text.syncCreatedCount}: ${created}`,
                 `${text.syncCandidateCount}: ${candidates}`,
@@ -174,7 +175,11 @@ export default class WereadNoteSyncPlugin extends Plugin {
             if (outcome.deferredBooks > 0) {
                 parts.push(`${text.syncDeferredCount}: ${outcome.deferredBooks}`);
             }
-            if (!outcome.ok || bookErrors > 0) {
+            if (skippedBooks > 0) {
+                // 复核随行修复：书级整书跳过（如回包异常）必须可见，不得显示为"成功+全零"
+                parts.push(`${text.syncSkippedCount}: ${skippedBooks}`);
+            }
+            if (!outcome.ok || bookErrors > 0 || skippedBooks > 0) {
                 showMessage(
                     `${text.syncDoneWithError}${parts.join("，")}，${text.syncBookErrorCount}: ${bookErrors}`,
                     7000,

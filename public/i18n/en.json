@@ -42,5 +42,6 @@
     "syncUnexpectedError": "Unexpected error during sync, please retry.",
     "settingAccountInvalid": "Account label contains unsupported characters",
     "syncItemErrorCount": "malformed items skipped",
-    "syncDeferredCount": "books deferred to next round (rotation)"
+    "syncDeferredCount": "books deferred to next round (rotation)",
+    "syncSkippedCount": "books skipped entirely (bad payload or protection mode; see skip reasons)"
 }

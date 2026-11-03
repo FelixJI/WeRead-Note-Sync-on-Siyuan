@@ -308,7 +308,7 @@ class FakeKernel {
         const cols = selectM[1].split(",").map((c) => c.trim());
         const where = selectM[2];
         const conds: Array<{ op: string; raw: string }> = [];
-        const condRe = /(ial not like|ial like|type !=|type=|root_id=|id=|content=|box=)\s*'((?:[^']|'')*)'(?:\s*escape\s*'\\\\')?/gu;
+        const condRe = /(ial not like|ial like|type !=|type=|root_id=|id !=|id=|content=|box=)\s*'((?:[^']|'')*)'(?:\s*escape\s*'\\\\')?/gu;
         for (const m of where.matchAll(condRe)) {
             conds.push({ op: m[1], raw: m[2] });
         }
@@ -360,6 +360,11 @@ class FakeKernel {
                     }
                 } else if (cond.op === "id=") {
                     if (b.id !== value) {
+                        ok = false;
+                        break;
+                    }
+                } else if (cond.op === "id !=") {
+                    if (b.id === value) {
                         ok = false;
                         break;
                     }
@@ -934,7 +939,7 @@ describe("同步引擎：非破坏导入与稳定块映射", () => {
                 reviews: [],
             },
         };
-        const { kernel, engine } = makeDeps(books);
+        const { kernel, persistence, engine } = makeDeps(books);
         const r = await engine.syncRound();
         expect(r.ok).toBe(true);
         const srcA = "测试账号/100077-_book/highlight/w1";
@@ -943,8 +948,48 @@ describe("同步引擎：非破坏导入与稳定块映射", () => {
         const b = kernel.itemBlocks().filter((b) => b.ial["custom-wrs-src"] === srcB);
         expect(a.length).toBe(1);
         expect(b.length).toBe(1);
-        // 删除 A 书状态后重建：A 的重建查询不得把 B 的块拉进来
-        const aDoc = kernel.allBlocks().find((d) => d.type === "d" && d.content === "通配符书")!;
-        expect(aDoc.id).toBeDefined();
+        // 真锁性质（复核随行）：删除 A 书状态后重建，A 的 items 不得包含 B 的 sourceKey
+        persistence.store.delete("book-100077-_book");
+        persistence.store.delete("book-100077-_book.prev");
+        const r2 = await engine.syncRound();
+        expect(r2.ok).toBe(true);
+        const rebuilt = persistence.store.get("book-100077-_book") as {
+            items: Record<string, unknown>;
+        };
+        const keys = Object.keys(rebuilt.items);
+        expect(keys.length).toBe(1);
+        expect(keys[0]).toBe(srcA);
+        // 且不重复导入（_ 不作为单字符通配匹配到 B 书）
+        expect(kernel.itemBlocks().length).toBe(2);
+    });
+
+    it("复核随行M4：文档创建窗口的空孤儿（无属性、无子块）→ 按标题认领并补属性", async () => {
+        const books = fixture();
+        const { kernel, persistence, engine } = makeDeps(books);
+        await engine.syncRound();
+        // 模拟真实创建窗口：createDocWithMd 成功、setBlockAttrs 前中断——
+        // 文档无属性无子块；书状态与 index 条目均未记 docId（index 本身仍在，笔记本不丢）
+        const doc = kernel.allBlocks().find((b) => b.type === "d")!;
+        for (const b of kernel.allBlocks()) {
+            if (b.rootId === doc.id && b.id !== doc.id) {
+                kernel.blocks.delete(b.id);
+            }
+        }
+        delete doc.ial["custom-wrs-book-id"];
+        delete doc.ial["custom-wrs-account"];
+        persistence.store.delete("book-10001");
+        persistence.store.delete("book-10001.prev");
+        const idx = persistence.store.get("index") as {
+            books: Record<string, { docId?: string }>;
+        };
+        delete idx.books["10001"]!.docId;
+
+        const r2 = await engine.syncRound();
+        expect(r2.ok).toBe(true);
+        // 空孤儿被认领（属性补齐）且没有第二份文档
+        expect(doc.ial["custom-wrs-book-id"]).toBe("10001");
+        expect(kernel.allBlocks().filter((b) => b.type === "d").length).toBe(1);
+        // 条目重新导入（状态已重建为空）
+        expect(kernel.itemBlocks().length).toBe(5);
     });
 });

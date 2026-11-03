@@ -212,7 +212,7 @@ export class SyncEngine {
 
         const oplog = await this.#loadOpLog();
         const round = this.#nextRound(index);
-        index = await this.#ensureNotebook(index, indexStore, oplog);
+        index = await this.#ensureNotebook(index, oplog);
 
         // 轮转处理（整改 M5）：从 rotation 游标起，避免固定截断导致后续书永久饥饿
         const total = notebooks.books.length;
@@ -227,14 +227,15 @@ export class SyncEngine {
         for (const entry of picked) {
             let bookOutcome: BookSyncOutcome;
             try {
-                bookOutcome = await this.#syncBook(
+                const r = await this.#syncBook(
                     index,
-                    indexStore,
                     oplog,
                     entry.bookId,
                     entry.title ?? entry.bookId,
                     round,
                 );
+                index = r.index;
+                bookOutcome = r.outcome;
             } catch (e) {
                 // 书级异常隔离：一本书失败不影响其他书（部分成功语义）
                 bookOutcome = {
@@ -258,10 +259,10 @@ export class SyncEngine {
             }
         }
 
-        // 游标推进并持久化（哪怕本轮部分失败，轮转保证下轮覆盖未处理书）
+        // 复核随行修复：index 全轮累积后单次持久化（含轮转游标）——
+        // 此前书级/轮转各自保存共享陈旧 base，会互相覆盖 books 条目
         const nextRotation = (rotation + picked.length) % (total === 0 ? 1 : total);
-        const rotatedIndex: SyncIndex = { ...index, rotation: nextRotation };
-        await indexStore.save(rotatedIndex);
+        await indexStore.save({ ...index, rotation: nextRotation });
 
         const candidatesReport: RoundOutcome["candidatesReport"] = [];
         const protectedReport: RoundOutcome["protectedReport"] = [];
@@ -329,11 +330,8 @@ export class SyncEngine {
         return gens.length === 0 ? 1 : Math.max(...gens) + 1;
     }
 
-    async #ensureNotebook(
-        index: SyncIndex,
-        indexStore: GenerationStore<SyncIndex>,
-        oplog: OpLog,
-    ): Promise<SyncIndex> {
+    /** 笔记本确保；index 由调用方累积后统一持久化（复核随行修复） */
+    async #ensureNotebook(index: SyncIndex, oplog: OpLog): Promise<SyncIndex> {
         if (index.notebookId !== undefined) {
             const notebooks = await this.#writer.listNotebooks();
             if (notebooks.some((nb) => nb.id === index.notebookId)) {
@@ -346,30 +344,26 @@ export class SyncEngine {
         );
         for (const row of found) {
             if (typeof row.box === "string" && row.box.length > 0) {
-                const next = { ...index, notebookId: row.box };
-                await indexStore.save(next);
-                return next;
+                return { ...index, notebookId: row.box };
             }
         }
         const opId = this.#opId();
         await oplog.append({ opId, ts: this.#now(), intent: "create-notebook", status: "pending" });
         const notebookId = await this.#writer.createNotebook(NOTEBOOK_NAME);
         await oplog.complete(opId, {});
-        const next = { ...index, notebookId };
-        await indexStore.save(next);
-        return next;
+        return { ...index, notebookId };
     }
 
     // ---------- 单书同步 ----------
 
+    /** 单书同步；返回书结果与累积后的 index（index 由 syncRound 末次统一持久化） */
     async #syncBook(
         index: SyncIndex,
-        indexStore: GenerationStore<SyncIndex>,
         oplog: OpLog,
         bookId: string,
         title: string,
         round: number,
-    ): Promise<BookSyncOutcome> {
+    ): Promise<{ outcome: BookSyncOutcome; index: SyncIndex }> {
         const store = this.#bookStore(bookId);
         const outcome: BookSyncOutcome = {
             bookId,
@@ -391,10 +385,13 @@ export class SyncEngine {
         } catch (e) {
             if (e instanceof StateCorruptionError) {
                 return {
-                    ...outcome,
-                    skipped: true,
-                    skipReason: `状态双世代损坏，保护模式停写：${e.message}`,
-                    error: e.message,
+                    outcome: {
+                        ...outcome,
+                        skipped: true,
+                        skipReason: `状态双世代损坏，保护模式停写：${e.message}`,
+                        error: e.message,
+                    },
+                    index,
                 };
             }
             throw e;
@@ -428,8 +425,11 @@ export class SyncEngine {
             detail = await this.#fetchDetail(bookId);
         } catch (e) {
             return {
-                ...outcome,
-                error: `来源拉取失败，本书跳过（状态未推进）：${(e as Error).message}`,
+                outcome: {
+                    ...outcome,
+                    error: `来源拉取失败，本书跳过（状态未推进）：${(e as Error).message}`,
+                },
+                index,
             };
         }
         outcome.itemErrors = detail.itemErrors?.length ?? 0;
@@ -453,14 +453,18 @@ export class SyncEngine {
             outcome.protectedCount += 1;
         }
         if (plan.skipped) {
-            return { ...outcome, skipped: true, skipReason: plan.skipReason };
+            return { outcome: { ...outcome, skipped: true, skipReason: plan.skipReason }, index };
         }
 
         // ---- 文档确保（含丢失找回）----
-        const docEnsured = await this.#ensureDoc(index, indexStore, oplog, store, state, bookId, title);
+        const docEnsured = await this.#ensureDoc(index, oplog, store, state, bookId, title);
         state = docEnsured.state;
+        index = docEnsured.index;
         if (docEnsured.error !== undefined || state.docId === undefined) {
-            return { ...outcome, error: docEnsured.error ?? "无法确定书籍文档，本书跳过" };
+            return {
+                outcome: { ...outcome, error: docEnsured.error ?? "无法确定书籍文档，本书跳过" },
+                index,
+            };
         }
         const docId = state.docId;
 
@@ -472,7 +476,10 @@ export class SyncEngine {
         for (const create of ordered) {
             const done = await this.#executeCreate(store, state, oplog, create, docId, bookId);
             if (done.error !== undefined) {
-                return { ...outcome, error: `创建中断（下轮可恢复）：${done.error}` };
+                return {
+                    outcome: { ...outcome, error: `创建中断（下轮可恢复）：${done.error}` },
+                    index,
+                };
             }
             state = done.state;
             outcome.created += 1;
@@ -494,8 +501,7 @@ export class SyncEngine {
             ...index,
             books: { ...index.books, [bookId]: { docId, title, generation: round } },
         };
-        await indexStore.save(nextIndex);
-        return outcome;
+        return { outcome, index: nextIndex };
     }
 
     async #fetchDetail(bookId: string): Promise<BookSourceDetail> {
@@ -697,19 +703,19 @@ export class SyncEngine {
 
     // ---------- 文档 ----------
 
+    /** 文档确保；index 变更随返回值累积（由 syncRound 末次统一持久化） */
     async #ensureDoc(
         index: SyncIndex,
-        indexStore: GenerationStore<SyncIndex>,
         oplog: OpLog,
         store: GenerationStore<BookSyncState>,
         state: BookSyncState,
         bookId: string,
         title: string,
-    ): Promise<{ state: BookSyncState; error?: string }> {
+    ): Promise<{ state: BookSyncState; index: SyncIndex; error?: string }> {
         if (state.docId !== undefined) {
             const kramdown = await this.#writer.getBlockKramdown(state.docId);
             if (kramdown !== undefined) {
-                return { state };
+                return { state, index };
             }
             // 文档 ID 失效：按属性找回（不盲目重建）
         }
@@ -719,10 +725,10 @@ export class SyncEngine {
         if (docs.length === 1) {
             const next = { ...state, docId: docs[0].id };
             await store.save(next);
-            return { state: next };
+            return { state: next, index };
         }
         if (docs.length > 1) {
-            return { state, error: "发现多份同身份书籍文档（属性歧义），需人工裁决后重试" };
+            return { state, index, error: "发现多份同身份书籍文档（属性歧义），需人工裁决后重试" };
         }
         // 文档创建窗口兜底（整改 M4：仅认领"空且无主"的孤儿文档）：
         // 非空的同名文档视为用户文档冲突——不认领、不新建，交人工处理
@@ -732,16 +738,18 @@ export class SyncEngine {
                 `select id from blocks where type='d' and content='${sqlEscape(sanitized)}' and box='${sqlEscape(index.notebookId)}' and ial not like '%custom-wrs-book-id=%'`,
             );
             if (byTitle.length > 1) {
-                return { state, error: `存在 ${byTitle.length} 份同名未绑定文档，歧义需人工裁决` };
+                return { state, index, error: `存在 ${byTitle.length} 份同名未绑定文档，歧义需人工裁决` };
             }
             if (byTitle.length === 1) {
                 const candidateId = byTitle[0].id;
+                // 复核随行修复：文档块自身 root_id 即自身 id，必须排除，否则空孤儿恒判"有内容"
                 const children = await this.#writer.sql(
-                    `select id from blocks where root_id='${sqlEscape(candidateId)}'`,
+                    `select id from blocks where root_id='${sqlEscape(candidateId)}' and id != '${sqlEscape(candidateId)}'`,
                 );
                 if (children.length > 0) {
                     return {
                         state,
+                        index,
                         error: `已存在同名文档《${sanitized}》且含内容，为避免误碰用户文档未自动认领；请人工处理后再同步`,
                     };
                 }
@@ -751,7 +759,13 @@ export class SyncEngine {
                 });
                 const next = { ...state, docId: candidateId };
                 await store.save(next);
-                return { state: next };
+                return {
+                    state: next,
+                    index: {
+                        ...index,
+                        books: { ...index.books, [bookId]: { docId: candidateId, title, generation: state.generation } },
+                    },
+                };
             }
         }
         const opId = this.#opId();
@@ -769,12 +783,13 @@ export class SyncEngine {
         await oplog.complete(opId, {});
         const next = { ...state, docId };
         await store.save(next);
-        const nextIndex: SyncIndex = {
-            ...index,
-            books: { ...index.books, [bookId]: { docId, title, generation: state.generation } },
+        return {
+            state: next,
+            index: {
+                ...index,
+                books: { ...index.books, [bookId]: { docId, title, generation: state.generation } },
+            },
         };
-        await indexStore.save(nextIndex);
-        return { state: next };
     }
 
     // ---------- 新建（§4 状态机）----------

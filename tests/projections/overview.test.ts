@@ -176,9 +176,13 @@ describe("T04 原生阅读总览投影", () => {
         // 全部投影块写入内容不含触发实体转义的半角字符
         const proj = kernel.allBlocks().filter((b) => b.rootId === ov.id || b.ial["custom-wrs-entry"] !== undefined || b.ial["custom-wrs-section"] === "bookmeta");
         for (const b of proj) {
-            expect(b.markdown).not.toContain("&");
-            expect(b.markdown).not.toContain('"');
-            expect(b.markdown).not.toContain(">");
+            // 仅动态引用行（((...)) 标签）必须不含实体转义触发字符；> 亦为 blockquote 语法故按行判
+            const refLines = b.markdown.split("
+").filter((l) => l.includes("(("));
+            for (const line of refLines) {
+                expect(line).not.toContain("&");
+                expect(line).not.toContain('"');
+            }
         }
         expect(kernel.allBlocks().some((b) => b.markdown.includes("三体＆＂地球＞往事"))).toBe(true);
         const r2 = await engine.syncRound();

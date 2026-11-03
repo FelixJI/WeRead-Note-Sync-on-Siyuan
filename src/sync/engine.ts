@@ -40,6 +40,7 @@ import { makeSourceKey, parseSourceKey, type SourceKind } from "./identity";
 import { classifyConflict, renderManualMerge } from "../review/model";
 import { projectOverview, type BookProjectionInfo, type RecentHighlightCandidate } from "../projections/overview";
 import { collectStats } from "../stats/service";
+import { WRITER_LEASE_MS, newWriterIdentity } from "./writer-guard";
 
 export interface SyncEngineDeps {
     persistence: StatePersistence;
@@ -52,6 +53,8 @@ export interface SyncEngineDeps {
     newOpId?: () => string;
     /** T04：轮末总览投影开关（默认开启；测试/特殊场景可关） */
     projectOverview?: boolean;
+    /** T06：写入端标识（缺省自动生成随机端） */
+    writerLabel?: string;
 }
 
 export interface BookSyncOutcome {
@@ -165,10 +168,12 @@ function isValidBookSyncState(v: unknown): boolean {
 export class SyncEngine {
     readonly #deps: SyncEngineDeps;
     readonly #writer: SiyuanWriter;
+    readonly #writerIdentity: { writerId: string; label: string };
 
     constructor(deps: SyncEngineDeps) {
         this.#deps = deps;
         this.#writer = new SiyuanWriter(deps.kernel);
+        this.#writerIdentity = newWriterIdentity(deps.writerLabel ?? "本地客户端");
     }
 
     #indexStore(): GenerationStore<SyncIndex> {
@@ -198,6 +203,36 @@ export class SyncEngine {
                 };
             }
             throw e;
+        }
+
+        // T06 单写入端守卫：非本端持有且租约未过期 → 整轮停写（AC1）
+        {
+            const claim = (index as SyncIndex & { writer?: unknown }).writer as
+                | { writerId: string; label: string; claimedAt: number; lastSeenAt: number }
+                | undefined;
+            const selfId = this.#writerIdentity.writerId;
+            const nowMs = Date.parse(this.#now()) || Date.now();
+            if (claim !== undefined && claim.writerId !== selfId && nowMs - claim.lastSeenAt < WRITER_LEASE_MS) {
+                return {
+                    ok: false,
+                    abortedReason: `另一写入端（${claim.label}）持有同步权（${Math.round((nowMs - claim.lastSeenAt) / 60000)} 分钟前活动）；本端只读，接管需等待租约过期或在该端停用。不承诺分布式互斥零窗口。`,
+                    books,
+                    deferredBooks: 0,
+                    candidatesReport: [],
+                    protectedReport: [],
+                };
+            }
+            const next = {
+                ...index,
+                writer: {
+                    writerId: selfId,
+                    label: this.#writerIdentity.label,
+                    claimedAt: claim?.writerId === selfId ? claim.claimedAt : nowMs,
+                    lastSeenAt: nowMs,
+                },
+            } as SyncIndex;
+            await indexStore.save(next);
+            index = next;
         }
 
         const client = createWereadClient(this.#deps.transport, this.#deps.apiKey);

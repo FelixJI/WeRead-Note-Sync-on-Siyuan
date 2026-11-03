@@ -40,8 +40,9 @@ export interface PaginateAllResult<T> {
     anomalies: string[];
 }
 
-// 递归稳定序列化：用于"同 ID 载荷是否一致"的确定论比较（键序无关）
-function stableStringify(value: unknown): string {
+// 递归稳定序列化：用于"同 ID 载荷是否一致"的确定论比较（键序无关）。
+// T02 起作为公共导出供 sync 层指纹（fingerprintPayload）复用；行为保持 T01 冻结不变。
+export function stableStringify(value: unknown): string {
     if (typeof value === "string") return JSON.stringify(value);
     if (value === null || typeof value === "number" || typeof value === "boolean") {
         return String(value);

@@ -10,18 +10,21 @@
     import { untrack } from "svelte";
     import { runConnectionTest, type ConnectionFailKind, type ConnectionTestOutcome } from "./connection";
     import type { ApiKeyStore } from "./api-key-store";
+    import type { AccountStore } from "./account-store";
     import type { SettingsText, SettingsTextKey } from "./i18n";
 
     interface Props {
         i18n: SettingsText;
         store: ApiKeyStore;
+        account: AccountStore;
     }
 
-    let { i18n, store }: Props = $props();
+    let { i18n, store, account }: Props = $props();
 
     // 刻意只取 store 的初始值做一次性快照（后续数据流为 UI -> store 单向写入）
     let apiKey: string = $state(untrack(() => store.key));
     let remember: boolean = $state(untrack(() => store.remember));
+    let namespace: string = $state(untrack(() => account.namespace));
     let keyVisible: boolean = $state(false);
     let testing: boolean = $state(false);
     let outcome: ConnectionTestOutcome | null = $state(null);
@@ -50,6 +53,14 @@
         if (target instanceof HTMLInputElement) {
             remember = target.checked;
             store.setRemember(remember);
+        }
+    }
+
+    function onNamespaceInput(event: Event): void {
+        const target = event.currentTarget;
+        if (target instanceof HTMLInputElement) {
+            namespace = target.value;
+            account.setNamespace(namespace);
         }
     }
 
@@ -118,6 +129,21 @@
             <span>{i18n.settingRememberLabel}</span>
         </label>
         <p class="wrns-hint">{i18n.settingStorageNotice}</p>
+    </div>
+
+    <div class="wrns-field">
+        <label class="wrns-label" for="wrns-account">{i18n.settingAccountLabel}</label>
+        <input
+            id="wrns-account"
+            class="b3-text-field fn__flex-1"
+            type="text"
+            value={namespace}
+            placeholder={i18n.settingAccountPlaceholder}
+            autocomplete="off"
+            spellcheck="false"
+            oninput={onNamespaceInput}
+        />
+        <p class="wrns-hint">{i18n.settingAccountHint}</p>
     </div>
 
     <div class="wrns-actions">

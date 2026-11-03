@@ -1,24 +1,35 @@
 /**
  * 微信读书笔记同步 - 思源笔记插件壳。
  *
- * 职责（T01）：
- * - 注册顶栏图标与“打开设置”命令占位（无业务 eventBus 订阅）。
+ * 职责（T01+T02）：
+ * - 注册顶栏图标（菜单：立即同步 / 打开设置）与命令。
  * - 构建思源 Setting 容器，承载 Svelte 5 设置页（mount/unmount）。
- * - API Key 持有策略（冻结）：默认仅会话内存；勾选“记住”才写入
- *   window.localStorage（键名 weread-note-sync.apiKey）；清除按钮一并清除。
+ * - API Key 持有策略（冻结）：默认仅会话内存；勾选“记住”才写 localStorage。
+ * - 账号命名空间（T02）：用户显式配置，参与 sourceKey 身份；不以 Key 哈希定义。
+ * - 立即同步：装配 SyncEngine（插件存储 + fetchSyncPost + forwardProxy 传输），
+ *   结果以 showMessage 摘要呈现（计数与状态，不含任何远端正文/凭证）。
  *
  * 安全约束：不输出任何日志；API Key 不进入 console/日志/诊断内容。
  */
-import { Plugin, Setting } from "siyuan";
+import { Plugin, Setting, showMessage, Menu } from "siyuan";
 import { mount, unmount } from "svelte";
 import SettingsPage from "./settings/settings-page.svelte";
 import { ApiKeyStore } from "./settings/api-key-store";
+import { AccountStore } from "./settings/account-store";
 import { createSettingsText, type SettingsText } from "./settings/i18n";
+import { createKernelForwardProxyTransport } from "./core/net/forward-proxy-transport";
+import { kernelForwardProxy } from "./adapters/siyuan/kernel";
+import { isValidWereadApiKey } from "./adapters/weread/client";
+import { SyncEngine } from "./sync/engine";
+import { createPluginPersistence, kernelCall } from "./sync/runtime";
 import "./index.scss";
 
 export default class WereadNoteSyncPlugin extends Plugin {
     /** API Key 存储：会话内存优先，见 src/settings/api-key-store.ts（冻结策略）。 */
     #apiKeyStore: ApiKeyStore = new ApiKeyStore();
+
+    /** 账号命名空间存储（非机密）。 */
+    #accountStore: AccountStore = new AccountStore();
 
     /** 设置页文案（内核 i18n + 内置兜底）。 */
     #text: SettingsText | null = null;
@@ -26,24 +37,32 @@ export default class WereadNoteSyncPlugin extends Plugin {
     /** Svelte 5 mount 返回的组件实例（无导出成员，仅用于 unmount）。 */
     #settingsApp: object | null = null;
 
+    /** 同步进行中标记（防重入）。 */
+    #syncing = false;
+
     onload(): void {
         this.#text = createSettingsText(this.i18n);
         const text = this.#text;
 
-        // 顶栏图标：打开设置页（首版无其他业务入口）
         this.addTopBar({
             icon: "iconSettings",
             title: text.topBarTip,
             position: "right",
-            callback: () => this.openSetting(),
+            callback: (event: MouseEvent) => this.#openMenu(event),
         });
 
-        // 命令占位：命令面板中的“打开设置”
         this.addCommand({
             langKey: "commandOpenSetting",
             langText: text.commandOpenSetting,
             hotkey: "",
             callback: () => this.openSetting(),
+        });
+
+        this.addCommand({
+            langKey: "commandSyncNow",
+            langText: text.commandSyncNow,
+            hotkey: "",
+            callback: () => void this.#syncNow(),
         });
 
         this.#setupSetting();
@@ -59,7 +78,7 @@ export default class WereadNoteSyncPlugin extends Plugin {
     }
 
     /**
-     * 覆写以统一三处入口（顶栏图标 / 命令 / 思源插件设置齿轮）：
+     * 覆写以统一入口（顶栏菜单 / 命令 / 思源插件设置齿轮）：
      * 打开承载 Svelte 设置页的 Setting 对话框（与内核默认实现一致）。
      */
     openSetting(): void {
@@ -67,6 +86,95 @@ export default class WereadNoteSyncPlugin extends Plugin {
             return;
         }
         this.setting.open(this.displayName || this.name);
+    }
+
+    #openMenu(event: MouseEvent): void {
+        const text = this.#text;
+        if (text === null) {
+            return;
+        }
+        const menu = new Menu("weread-note-sync-topbar");
+        menu.addItem({
+            icon: "iconRefresh",
+            label: text.commandSyncNow,
+            click: () => void this.#syncNow(),
+        });
+        menu.addSeparator();
+        menu.addItem({
+            icon: "iconSettings",
+            label: text.commandOpenSetting,
+            click: () => this.openSetting(),
+        });
+        menu.open({ x: event.clientX, y: event.clientY });
+    }
+
+    async #syncNow(): Promise<void> {
+        const text = this.#text;
+        if (text === null || this.#syncing) {
+            return;
+        }
+        const apiKey = this.#apiKeyStore.key;
+        const namespace = this.#accountStore.namespace;
+        if (!isValidWereadApiKey(apiKey)) {
+            showMessage(text.syncNeedApiKey, 4000, "error");
+            this.openSetting();
+            return;
+        }
+        if (namespace.length === 0) {
+            showMessage(text.syncNeedAccount, 4000, "error");
+            this.openSetting();
+            return;
+        }
+        // 换 Key 提醒（keyMarker 只提醒，绝不自动换账号）
+        const keyChanged = await this.#accountStore.noteApiKey(apiKey);
+        if (keyChanged) {
+            showMessage(`⚠️ ${text.syncKeyChangedWarning}`, 6000, "info");
+        }
+
+        this.#syncing = true;
+        showMessage(text.syncRunning, 2000, "info");
+        try {
+            const engine = new SyncEngine({
+                persistence: createPluginPersistence(this),
+                kernel: kernelCall,
+                transport: createKernelForwardProxyTransport(kernelForwardProxy),
+                apiKey,
+                accountNamespace: namespace,
+            });
+            const outcome = await engine.syncRound();
+            if (outcome.protectionMode !== undefined) {
+                showMessage(`${text.syncDoneWithError}${outcome.protectionMode}`, 7000, "error");
+                return;
+            }
+            if (outcome.abortedReason !== undefined) {
+                showMessage(`${text.syncDoneWithError}${outcome.abortedReason}`, 7000, "error");
+                return;
+            }
+            const created = outcome.books.reduce((s, b) => s + b.created, 0);
+            const candidates = outcome.candidatesReport.length;
+            const protectedCount = outcome.protectedReport.length;
+            const bookErrors = outcome.books.filter((b) => b.error !== undefined && !b.skipped).length;
+            const parts = [
+                `${text.syncCreatedCount}: ${created}`,
+                `${text.syncCandidateCount}: ${candidates}`,
+                `${text.syncProtectedCount}: ${protectedCount}`,
+            ];
+            if (bookErrors > 0) {
+                showMessage(
+                    `${text.syncDoneWithError}${parts.join("，")}，${text.syncBookErrorCount}: ${bookErrors}`,
+                    6000,
+                    "error",
+                );
+            } else {
+                showMessage(`${text.syncDoneOk}${parts.join("，")}`, 4000, "info");
+            }
+        } catch (e) {
+            // 异常文本可能含上下文：仅展示通用提示（脱敏在 core 层，此处不透出原始消息）
+            void e;
+            showMessage(text.syncUnexpectedError, 5000, "error");
+        } finally {
+            this.#syncing = false;
+        }
     }
 
     #setupSetting(): void {
@@ -83,6 +191,7 @@ export default class WereadNoteSyncPlugin extends Plugin {
             props: {
                 i18n: text,
                 store: this.#apiKeyStore,
+                account: this.#accountStore,
             },
         });
 

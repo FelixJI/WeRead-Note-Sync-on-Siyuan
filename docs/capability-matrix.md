@@ -27,9 +27,11 @@
 | errcode/upgrade_info/鉴权失败语义 | 同上 | MOCK-TESTED | tests/contracts/gateway.test.ts |
 | Key 脱敏（wrk- 前缀、Bearer） | 纯函数 | MOCK-TESTED | tests/contracts/redact.test.ts |
 | 白名单守卫（唯一网关 URL） | 纯函数 | MOCK-TESTED | tests/contracts/whitelist.test.ts |
+| 非破坏导入引擎（幂等/块映射/中断恢复/保护状态，AC1–AC7） | 引擎 + FakeKernel 故障注入 | MOCK-TESTED（tests/sync/engine.test.ts 20 例 + 纯函数层 98 例，2026-11-03 T02） | 设计契约 docs/design/t02-sync-core.md |
 | 真实网关连通（有效/无效 Key） | — | UNVERIFIED-LIVE | 需用户本地 Key；代码路径已具备 |
-| 思源块原位更新后 ID/属性/引用保留 | — | UNVERIFIED-LIVE | 需授权隔离内核；未实测前不进入自动写入路径 |
+| 思源块原位更新后 ID/属性/引用保留 | — | UNVERIFIED-LIVE | T02 未启用任何原位更新路径（只新建）；待授权隔离内核取证 |
 | 思源 localStorage 密钥存储同步范围 | — | UNVERIFIED-LIVE | 文档如实标注：按端本地存储，非加密、不经内核同步 |
+| 账号命名空间 | 用户显式配置 + keyMarker 换 Key 提醒 | 已实现（不自动换账号）；服务端身份字段探测 UNVERIFIED-LIVE | src/settings/account-store.ts |
 
 ## 代理解包
 

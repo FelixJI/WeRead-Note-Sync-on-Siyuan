@@ -8,7 +8,8 @@ Reliable WeRead-to-SiYuan note synchronization with stable block mapping, diff r
 
 - 数据源：微信读书**官方 Agent API Gateway**（`https://i.weread.qq.com/api/agent/gateway`，Bearer `wrk-` Key）。
 - 写入通道：思源笔记**公开内核 API**（不直接改 `.sy` 文件或数据库）。
-- 当前版本（T01）交付：插件壳、设置页（API Key 管理 + 连接测试）、构建与 CI；笔记拉取与写入按任务分期推进（见 [docs/capability-matrix.md](docs/capability-matrix.md)）。
+- 当前版本（T01+T02）交付：插件壳、设置页（API Key 管理 + 连接测试 + 账号标识）、**非破坏导入同步引擎**（顶栏菜单/命令「立即同步」）：独立「微信读书」笔记本、每书一篇文档、划线/想法按章节导入为块引用级内容、稳定 sourceKey 块映射、操作意图先行 + 回读核对 + 中断恢复、来源变化只产生待审候选（不覆盖本地）、本地删除不复活、分页异常整书跳过（设计契约见 [docs/design/t02-sync-core.md](docs/design/t02-sync-core.md)）。
+- 同步安全语义：**只新建，不更新/不删除既有块**；用户自加内容永不触碰；规范引用锚点（块 ID）跨同步稳定；待审 diff 与冲突决策在后续任务交付。
 
 ## 安全边界
 

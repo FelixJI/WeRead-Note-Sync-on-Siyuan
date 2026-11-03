@@ -177,8 +177,7 @@ describe("T04 原生阅读总览投影", () => {
         const proj = kernel.allBlocks().filter((b) => b.rootId === ov.id || b.ial["custom-wrs-entry"] !== undefined || b.ial["custom-wrs-section"] === "bookmeta");
         for (const b of proj) {
             // 仅动态引用行（((...)) 标签）必须不含实体转义触发字符；> 亦为 blockquote 语法故按行判
-            const refLines = b.markdown.split("
-").filter((l) => l.includes("(("));
+            const refLines = b.markdown.split("\n").filter((l) => l.includes("(("));
             for (const line of refLines) {
                 expect(line).not.toContain("&");
                 expect(line).not.toContain('"');

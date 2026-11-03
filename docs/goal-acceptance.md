@@ -10,7 +10,7 @@
 | GAC2 独改/均改/移位/改名/删除/拆合保护；锚点不删建；双链指向原 ID | MOCK-TESTED | PR#9（moved-out/user-deleted/unseen/歧义隔离 5 例）；PR#10（AC2 锚点跨轮稳定） |
 | GAC3 五种 diff 决策持久化；保留本地同版本不重复打扰；不覆盖 | MOCK-TESTED | PR#10（keep-local 去重、stale 拒绝、中断三分支收养/重议/隔离） |
 | GAC4 故障注入无盲目重建/删除/错误基线推进 | MOCK-TESTED | PR#9（四切断点+双世代损坏保护+复制属性）；PR#10（pendingUpdate 重入+身份校验） |
-| GAC5 总览动态引用/统计文本/热力图快照正确；单位/日桶/时区/闰年；失败不破坏笔记 | MOCK-TESTED（真实环境视觉 UNVERIFIED） | PR#11（AC1-AC4）；PR#12（单位/四态/闰年/冷却测试；本 PR 门禁全量 349 全绿） |
+| GAC5 总览动态引用/统计文本/热力图快照正确；单位/日桶/时区/闰年；失败不破坏笔记 | MOCK-TESTED（真实环境视觉 UNVERIFIED） | PR#11（AC1-AC4）；PR#12（单位/四态/闰年/冷却测试；本 PR 门禁全量 375 全绿） |
 | GAC6 桌面+浏览器闭环；深浅色/窄屏；停用可读；移动端原生阅读 | 代码路径就绪；**真实端到端 UNVERIFIED-LIVE** | 桌面/浏览器共用 fetchSyncPost+forwardProxy（PR#8）；停用可读=全原生 kramdown（PR#11 AC4 测试）；截图/操作证据待真实环境 |
 | GAC7 单写入端/状态分叉保护/升级恢复；无秘密泄露；MIT | 单写入端 MOCK-TESTED（引擎级：同端两轮不自锁/他端活跃零写入/过期显式接管/决策路径受护/停用释放；纯函数 4 例）；升级恢复=双世代+意图先行（PR#9）；秘密=CI 零密钥+脱敏测试（PR#8） | 本 PR writer-engine 5 例+writer-guard 4 例；审阅决策路径例外已消除（守卫覆盖 applyDecision） |
 | GAC8 SHA/证据/审阅可追溯；PR 合并不替代组合验收 | 本表即组合验收记录；各 PR 均经独立审阅（T02/T04/T05 首轮 FAIL→整改→PASS） | PR#8/#9/#10/#11/#12 及其审阅评论 |

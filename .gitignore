@@ -6,3 +6,4 @@ dist/
 Thumbs.db
 # AI Flow 运行时探针日志：仅本地证据，不入库
 .ai-flow/runtime/
+package.zip

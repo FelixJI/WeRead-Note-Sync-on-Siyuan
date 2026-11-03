@@ -81,6 +81,11 @@ export default class WereadNoteSyncPlugin extends Plugin {
     }
 
     onunload(): void {
+        // T06：停用即释放写入端租约（他端可立即接管，不等 30 分钟）
+        const engine = this.#buildEngine();
+        if (engine !== null) {
+            void engine.releaseWriter();
+        }
         // 仅清会话内存；用户勾选“记住”时 localStorage 保留（策略见 api-key-store.ts）
         this.#apiKeyStore.dispose();
         if (this.#settingsApp !== null) {
@@ -214,7 +219,30 @@ export default class WereadNoteSyncPlugin extends Plugin {
             transport: createKernelForwardProxyTransport(kernelForwardProxy),
             apiKey,
             accountNamespace: namespace,
+            writerIdentity: this.#writerIdentity(),
         });
+    }
+
+    /** T06：写入端身份按客户端持久化（localStorage 一次性生成复用——杜绝同端自锁 30 分钟） */
+    #writerIdentity(): { writerId: string; label: string } {
+        const KEY_ID = "weread-note-sync.writerId";
+        const KEY_LABEL = "weread-note-sync.writerLabel";
+        try {
+            let id = window.localStorage.getItem(KEY_ID);
+            if (id === null || id.length === 0) {
+                id = `w-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
+                window.localStorage.setItem(KEY_ID, id);
+            }
+            let label = window.localStorage.getItem(KEY_LABEL);
+            if (label === null || label.length === 0) {
+                const ua = navigator.userAgent.toLowerCase();
+                label = ua.includes("mobile") ? "移动端浏览器" : ua.includes("electron") ? "桌面端" : "浏览器端";
+                window.localStorage.setItem(KEY_LABEL, label);
+            }
+            return { writerId: id, label };
+        } catch {
+            return { writerId: `w-session-${Date.now().toString(36)}`, label: "本端" };
+        }
     }
 
     async #syncNow(): Promise<void> {
@@ -263,6 +291,9 @@ export default class WereadNoteSyncPlugin extends Plugin {
             if (outcome.abortedReason !== undefined) {
                 showMessage(`${text.syncDoneWithError}${outcome.abortedReason}`, 7000, "error");
                 return;
+            }
+            if (outcome.takeoverNotice !== undefined) {
+                showMessage(`⚠️ ${outcome.takeoverNotice}`, 6000, "info");
             }
             const created = outcome.books.reduce((s, b) => s + b.created, 0);
             const candidates = outcome.candidatesReport.length;

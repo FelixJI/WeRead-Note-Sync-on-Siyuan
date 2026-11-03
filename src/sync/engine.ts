@@ -40,6 +40,7 @@ import { makeSourceKey, parseSourceKey, type SourceKind } from "./identity";
 import { classifyConflict, renderManualMerge } from "../review/model";
 import { projectOverview, type BookProjectionInfo, type RecentHighlightCandidate } from "../projections/overview";
 import { collectStats } from "../stats/service";
+import { WRITER_LEASE_MS, newWriterIdentity, checkOrClaimWriter } from "./writer-guard";
 
 export interface SyncEngineDeps {
     persistence: StatePersistence;
@@ -52,6 +53,10 @@ export interface SyncEngineDeps {
     newOpId?: () => string;
     /** T04：轮末总览投影开关（默认开启；测试/特殊场景可关） */
     projectOverview?: boolean;
+    /** T06：写入端标识（缺省自动生成随机端） */
+    writerLabel?: string;
+    /** T06：稳定写入端身份（插件层持久化复用——杜绝同端自锁；优先于 writerLabel） */
+    writerIdentity?: { writerId: string; label: string };
 }
 
 export interface BookSyncOutcome {
@@ -80,6 +85,8 @@ export interface RoundOutcome {
     deferredBooks: number;
     /** T04：总览投影失败数（投影失败不影响同步本体结果） */
     projectionErrors?: number;
+    /** T06：写入端接管通知（显式、可追溯，非静默） */
+    takeoverNotice?: string;
     /** T04：投影如实上报（歧义跳过/重建/复盘区缺失等） */
     projectionAnomalies?: string[];
     candidatesReport: Array<{ bookId: string; sourceKey: string; reason: string }>;
@@ -165,10 +172,12 @@ function isValidBookSyncState(v: unknown): boolean {
 export class SyncEngine {
     readonly #deps: SyncEngineDeps;
     readonly #writer: SiyuanWriter;
+    readonly #writerIdentity: { writerId: string; label: string };
 
     constructor(deps: SyncEngineDeps) {
         this.#deps = deps;
         this.#writer = new SiyuanWriter(deps.kernel);
+        this.#writerIdentity = deps.writerIdentity ?? newWriterIdentity(deps.writerLabel ?? "本地客户端");
     }
 
     #indexStore(): GenerationStore<SyncIndex> {
@@ -198,6 +207,32 @@ export class SyncEngine {
                 };
             }
             throw e;
+        }
+
+        // T06 单写入端守卫（审阅整改 B1/M1：统一调用 checkOrClaimWriter，杜绝双实现分歧）
+        let takeoverNotice: string | undefined;
+        {
+            const nowMs = Date.parse(this.#now()) || Date.now();
+            const check = checkOrClaimWriter(index, this.#writerIdentity, nowMs);
+            if (!check.ok && check.reason === "conflict") {
+                return {
+                    ok: false,
+                    abortedReason: `另一写入端（${check.holder.label}）持有同步权（${Math.round((nowMs - check.holder.lastSeenAt) / 60000)} 分钟前活动）；本端只读。该端停用即释放（onunload），或等待租约过期自动接管。不承诺分布式互斥零窗口。`,
+                    books,
+                    deferredBooks: 0,
+                    candidatesReport: [],
+                    protectedReport: [],
+                };
+            }
+            if (!check.ok) {
+                throw new Error(check.message);
+            }
+            const next: SyncIndex = { ...index, writer: check.claim };
+            await indexStore.save(next);
+            index = next;
+            if (check.takeover) {
+                takeoverNotice = "已接管过期写入端（租约超时）；本次接管已记录，可追溯。";
+            }
         }
 
         const client = createWereadClient(this.#deps.transport, this.#deps.apiKey);
@@ -386,6 +421,7 @@ export class SyncEngine {
             deferredBooks,
             ...(projectionErrors > 0 ? { projectionErrors } : {}),
             ...(projectionAnomalies.length > 0 ? { projectionAnomalies } : {}),
+            ...(takeoverNotice !== undefined ? { takeoverNotice } : {}),
             candidatesReport,
             protectedReport,
         };
@@ -1185,6 +1221,23 @@ export class SyncEngine {
         if (action === "defer") {
             return { ok: true };
         }
+        // 审阅整改 M2：单写入端守卫同样约束决策写入路径（他端活跃租约 → 拒绝写入）
+        {
+            const index = await this.#indexStore().load();
+            const holder = index?.writer;
+            if (
+                index !== undefined &&
+                holder !== undefined &&
+                holder.writerId !== this.#writerIdentity.writerId &&
+                (Date.parse(this.#now()) || Date.now()) - holder.lastSeenAt < WRITER_LEASE_MS
+            ) {
+                return {
+                    ok: false,
+                    kind: "not-found",
+                    message: `另一写入端（${holder.label}）持有同步权，本端为只读；决策写入被拒绝`,
+                };
+            }
+        }
         if (action === "keep-local") {
             // 不写块：推进已处理远端版本 + 本地为权威 → 同一远端版本不再打扰（AC3）
             item.versionFingerprint = item.pendingRemote.fingerprint;
@@ -1456,6 +1509,17 @@ export class SyncEngine {
             .sort((a, b) => (b[1].generation ?? 0) - (a[1].generation ?? 0))
             .slice(0, limit)
             .map(([bookId, entry]) => ({ bookId, title: entry.title ?? bookId }));
+    }
+
+    /** T06：释放写入端租约（插件停用/卸载调用——允许他端立即接管，而非等 30 分钟） */
+    async releaseWriter(): Promise<void> {
+        const indexStore = this.#indexStore();
+        const index = await indexStore.load();
+        if (index === undefined || index.writer?.writerId !== this.#writerIdentity.writerId) {
+            return;
+        }
+        const next: SyncIndex = { ...index, writer: undefined };
+        await indexStore.save(next);
     }
 
     // ---------- 小工具 ----------

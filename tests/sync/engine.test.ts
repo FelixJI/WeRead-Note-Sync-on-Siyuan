@@ -106,7 +106,7 @@ export class FakeTransport implements Transport {
 
 // ---------- FakeKernel ----------
 
-interface FakeBlock {
+export interface FakeBlock {
     id: string;
     type: string; // d / h / 其他
     content: string;
@@ -641,15 +641,15 @@ describe("同步引擎：非破坏导入与稳定块映射", () => {
     it("AC3-切断3：块创建+记账前持久化失败 → 下一轮收养不重复", async () => {
         const books = fixture();
         const { kernel, persistence, engine } = makeDeps(books);
-        // 记账链路的 bookName 保存序：1=重建init、2/3=ensureDoc(prev+cur)、4/5=意图(prev+cur)、6/7=记账(prev+cur)
-        // 拦截第 6 次（记账世代写入）→ 落块成功但账未记
+        // 记账链路的 bookName 保存序（仅计 <name> 本身、不含 .prev；T03 整改 M5 后实测）：
+        // 1=重建init、2=候选提前落盘、3=ensureDoc、4=h1 意图、5=h1 记账 ←拦截此点（落块成功但账未记）
         const bookName = "book-10001";
         let bookSaves = 0;
         const origSave = persistence.save.bind(persistence);
         persistence.save = async (name: string, content: unknown) => {
             if (name === bookName) {
                 bookSaves += 1;
-                if (bookSaves === 6) {
+                if (bookSaves === 5) {
                     throw new Error("注入：记账保存失败");
                 }
             }

@@ -16,6 +16,9 @@ export interface OpLogEntry {
     sourceKey?: string;
     blockId?: string;
     payloadText?: string;
+    /** T03：update-block 完整 before/after 快照（审计用，不截断） */
+    beforeText?: string;
+    afterText?: string;
     status: "pending" | "done" | "failed";
     error?: string;
 }

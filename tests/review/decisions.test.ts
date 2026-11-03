@@ -3,7 +3,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { SyncEngine, stripIal } from "../../src/sync/engine";
-import { FakeKernel, FakeTransport, MemoryPersistence, fixture, type BookScript } from "../sync/engine.test";
+import { FakeKernel, FakeTransport, MemoryPersistence, fixture, type BookScript, type FakeBlock } from "../sync/engine.test";
 
 const KEY = "wrk-test-key-0001";
 const NS = "测试账号";
@@ -30,6 +30,14 @@ function changeH1(books: Record<string, BookScript>, text: string): void {
     books["10001"]!.highlights = books["10001"]!.highlights.map((h) =>
         h.bookmarkId === "h1" ? { ...h, markText: text } : h,
     );
+}
+
+function kernel_doc(d: ReturnType<typeof makeDeps>): FakeBlock {
+    const doc = d.kernel.allBlocks().find((b) => b.type === "d");
+    if (doc === undefined) {
+        throw new Error("doc 不存在");
+    }
+    return doc;
 }
 
 describe("T03 审阅队列与受控决策", () => {
@@ -144,7 +152,8 @@ describe("T03 审阅队列与受控决策", () => {
         const queue = await deps.engine.buildReviewQueue();
         const block = deps.kernel.itemBlocks().find((b) => b.ial["custom-wrs-src"] === SRC_H1)!;
 
-        const r = await deps.engine.applyDecision(SRC_H1, "manual-merge", "我手动合并的最终文本", queue[0]!.local);
+        // 整改 B1 语义：manualText 即最终 markdown（UI 预填远端渲染文本，幂等确认）
+        const r = await deps.engine.applyDecision(SRC_H1, "manual-merge", "> 我手动合并的最终文本", queue[0]!.local);
         expect(r.ok).toBe(true);
         expect(block.markdown).toBe("> 我手动合并的最终文本");
         expect(block.ial["custom-wrs-src"]).toBe(SRC_H1);
@@ -197,6 +206,88 @@ describe("T03 审阅队列与受控决策", () => {
         };
         expect(state.items[SRC_H1]?.status).toBe("active");
         expect(stripIal(state.items[SRC_H1]?.localBaseline ?? "")).toContain("落地但验证失败");
+    });
+
+    it("整改M2组合：更新落地+身份丢失+验证读失败 → 下轮收养分支拒绝（隔离而非当健康收养）", async () => {
+        const books = fixture();
+        const deps = makeDeps(books);
+        await deps.engine.syncRound();
+        changeH1(books, "组合故障文本");
+        await deps.engine.syncRound();
+        const queue = await deps.engine.buildReviewQueue();
+        deps.kernel.dropIdentityOnUpdate = true;
+        // 验证回读（步骤4）失败：决策流程内第 2 次 getBlockKramdown
+        deps.kernel.failReadAt.add(deps.kernel.readCount + 2);
+        const r = await deps.engine.applyDecision(SRC_H1, "apply-remote", undefined, queue[0]!.local);
+        expect(r.ok).toBe(false);
+        // 块内容已落地但身份属性丢失
+        const block = deps.kernel.allBlocks().find((b) => b.markdown.includes("组合故障文本"))!;
+        expect(block).toBeDefined();
+        expect(block.ial["custom-wrs-src"]).toBeUndefined();
+        // 下一轮 reconcile：内容==after 但身份缺失 → 不收养，隔离
+        const r2 = await deps.engine.syncRound();
+        expect(r2.books[0]?.quarantined).toBeGreaterThanOrEqual(1);
+        const state = deps.persistence.store.get("book-10001") as {
+            items: Record<string, { status: string }>;
+        };
+        expect(state.items[SRC_H1]?.status).toBe("quarantined");
+    });
+
+    it("整改M4：隔离态条目不入队列、决策被拒绝（防绕过多块歧义保护）", async () => {
+        const books = fixture();
+        const deps = makeDeps(books);
+        await deps.engine.syncRound();
+        changeH1(books, "会被隔离的变更");
+        await deps.engine.syncRound(); // 候选正常落盘（pendingRemote 持久化）
+        // 制造隔离+pendingRemote 共存的持久态：复制属性 → 下轮 audit 隔离（立即落盘），随后 fetchDetail 注入失败使轮早退（pendingRemote 保留）
+        const doc = kernel_doc(deps);
+        const h1 = deps.kernel.itemBlocks().find((b) => b.ial["custom-wrs-src"] === SRC_H1)!;
+        const clone = { ...h1, id: "clone-x", ial: { ...h1.ial, id: "clone-x" }, children: [] as string[] };
+        deps.kernel.blocks.set("clone-x", clone as typeof h1);
+        doc.children.push("clone-x");
+        // 下轮：audit 隔离（保存）→ fetchDetail 失败早退 → 持久态 = quarantined + pendingRemote
+        const origPost = deps.transport.post.bind(deps.transport);
+        let brokeFetch = false;
+        deps.transport.post = async (url: string, body: unknown) => {
+            const req = body as Record<string, unknown>;
+            if (req.api_name === "/book/bookmarklist" && !brokeFetch) {
+                brokeFetch = true;
+                return { status: 200, body: JSON.stringify({ errcode: 0, updated: null }), contentType: "application/json" };
+            }
+            return origPost(url, body);
+        };
+        await deps.engine.syncRound();
+        const state = deps.persistence.store.get("book-10001") as {
+            items: Record<string, { status: string; pendingRemote?: unknown }>;
+        };
+        expect(state.items[SRC_H1]?.status).toBe("quarantined");
+        expect(state.items[SRC_H1]?.pendingRemote).toBeDefined();
+        // 队列不含隔离条目
+        const queue = await deps.engine.buildReviewQueue();
+        expect(queue.some((c) => c.sourceKey === SRC_H1)).toBe(false);
+        // 决策被拒
+        const r = await deps.engine.applyDecision(SRC_H1, "apply-remote", undefined, "whatever");
+        expect(r.ok).toBe(false);
+    });
+
+    it("整改M5：文档确保失败轮 → 候选已落盘，队列可审", async () => {
+        const books = fixture();
+        const deps = makeDeps(books);
+        await deps.engine.syncRound();
+        // 制造文档属性歧义：删除原 doc 本身（条目块保留为可读孤儿），并放两份带相同
+        // custom-wrs-book-id 的克隆 → state.docId 失效 → by-attr 命中 2 份 → 人工裁决错误
+        const doc = kernel_doc(deps);
+        const mkClone = (id: string): FakeBlock => ({ ...doc, id, ial: { ...doc.ial, id }, children: [] });
+        deps.kernel.blocks.set("doc-clone-1", mkClone("doc-clone-1"));
+        deps.kernel.blocks.set("doc-clone-2", mkClone("doc-clone-2"));
+        deps.kernel.blocks.delete(doc.id);
+        changeH1(books, "文档失败轮的变更");
+
+        const r2 = await deps.engine.syncRound();
+        expect(r2.books[0]?.error).toBeDefined(); // 文档歧义失败（人工裁决）
+        // 候选已落盘（M5）：失败轮后队列仍可审
+        const queue = await deps.engine.buildReviewQueue();
+        expect(queue.some((c) => c.sourceKey === SRC_H1)).toBe(true);
     });
 
     it("回读验证失败（身份属性丢失）→ 隔离 + 快照留存，不自动补救", async () => {

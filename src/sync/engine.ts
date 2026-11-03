@@ -37,6 +37,7 @@ import {
 import { computePlan, type SyncPlan } from "./plan";
 import { OpLog, type OpLogEntry } from "./oplog";
 import { makeSourceKey, parseSourceKey, type SourceKind } from "./identity";
+import { classifyConflict, renderManualMerge } from "../review/model";
 
 export interface SyncEngineDeps {
     persistence: StatePersistence;
@@ -468,30 +469,33 @@ export class SyncEngine {
             round,
             accountNamespace: this.#deps.accountNamespace,
         });
-        // T03：候选持久化为 pendingRemote（UI 审阅队列数据源）；本轮未再变化的条目清除旧候选
-        const candidateKeys = new Set(plan.candidates.map((c) => c.sourceKey));
-        const payloadByKey = new Map<string, { payload: Record<string, unknown>; rendered: string }>();
-        for (const h of detail.highlights) {
-            payloadByKey.set(this.#sourceKey(bookId, "highlight", h.bookmarkId), { payload: h.raw, rendered: renderHighlightBlock(h.markText) });
-        }
-        for (const r of detail.reviews) {
-            payloadByKey.set(this.#sourceKey(bookId, "review", r.reviewId), { payload: r.raw, rendered: renderReviewChild(r.content) });
-        }
-        for (const c of plan.candidates) {
-            const src = payloadByKey.get(c.sourceKey);
-            const item = state.items[c.sourceKey];
-            if (src !== undefined && item !== undefined) {
-                item.pendingRemote = {
-                    renderedText: src.rendered,
-                    fingerprint: c.newFingerprint,
-                    payload: src.payload,
-                    detectedAt: this.#now(),
-                };
+        // 审阅整改：拉取异常整书跳过时零状态变更（含候选清除——异常轮不得动既有 pendingRemote）
+        if (!plan.skipped) {
+            // T03：候选持久化为 pendingRemote（UI 审阅队列数据源）；本轮未再变化的条目清除旧候选
+            const candidateKeys = new Set(plan.candidates.map((c) => c.sourceKey));
+            const payloadByKey = new Map<string, { payload: Record<string, unknown>; rendered: string }>();
+            for (const h of detail.highlights) {
+                payloadByKey.set(this.#sourceKey(bookId, "highlight", h.bookmarkId), { payload: h.raw, rendered: renderHighlightBlock(h.markText) });
             }
-        }
-        for (const [key, item] of Object.entries(state.items)) {
-            if (!candidateKeys.has(key) && item.pendingRemote !== undefined) {
-                item.pendingRemote = undefined;
+            for (const r of detail.reviews) {
+                payloadByKey.set(this.#sourceKey(bookId, "review", r.reviewId), { payload: r.raw, rendered: renderReviewChild(r.content) });
+            }
+            for (const c of plan.candidates) {
+                const src = payloadByKey.get(c.sourceKey);
+                const item = state.items[c.sourceKey];
+                if (src !== undefined && item !== undefined) {
+                    item.pendingRemote = {
+                        renderedText: src.rendered,
+                        fingerprint: c.newFingerprint,
+                        payload: src.payload,
+                        detectedAt: this.#now(),
+                    };
+                }
+            }
+            for (const [key, item] of Object.entries(state.items)) {
+                if (!candidateKeys.has(key) && item.pendingRemote !== undefined) {
+                    item.pendingRemote = undefined;
+                }
             }
         }
         for (const c of plan.candidates) {
@@ -508,6 +512,9 @@ export class SyncEngine {
         if (plan.skipped) {
             return { outcome: { ...outcome, skipped: true, skipReason: plan.skipReason }, index };
         }
+        // 审阅整改 M5：候选检测立即落盘——先于文档确保等任何后续失败路径；
+        // 否则失败轮只上报不持久，复发性错误会让候选永远进不了审阅队列（AC4 可恢复性）
+        await store.save(state);
 
         // ---- 文档确保（含丢失找回）----
         const docEnsured = await this.#ensureDoc(index, oplog, store, state, bookId, title);
@@ -1017,13 +1024,13 @@ export class SyncEngine {
                 continue;
             }
             for (const [sourceKey, item] of Object.entries(state.items)) {
-                if (item.pendingRemote === undefined || item.blockId === undefined) {
-                    continue;
+                if (item.pendingRemote === undefined || item.blockId === undefined || item.status !== "active") {
+                    continue; // 审阅整改 M4：非 active（隔离/已删/移出）不入审阅队列
                 }
                 const kramdown = await this.#writer.getBlockKramdown(item.blockId);
                 const local = kramdown !== undefined ? stripIal(kramdown) : item.localBaseline ?? "";
                 const baseline = item.localBaseline ?? "";
-                const conflict = this.#classify(baseline, local, item.pendingRemote.renderedText);
+                const conflict = classifyConflict(baseline, local, item.pendingRemote.renderedText);
                 queue.push({
                     bookId,
                     bookTitle: entry.title ?? bookId,
@@ -1042,31 +1049,17 @@ export class SyncEngine {
         return queue;
     }
 
-    #classify(baseline: string, local: string, remote: string): ReviewCandidate["conflict"] {
-        const b = baseline.trim();
-        const l = local.trim();
-        const r = remote.trim();
-        if (l === r) {
-            return "identical";
-        }
-        if (l === b) {
-            return "remote-only";
-        }
-        if (r === b) {
-            return "local-only";
-        }
-        return "both-changed";
-    }
-
     /**
      * 执行用户决策（唯一块更新写入口，设计契约 §2/§3）。
-     * expectedLocal 为决策时快照（队列会话缓存），与现状不符 → 过期拒绝（AC4）。
+     * expectedLocal 为决策时快照（队列会话缓存），与现状不符 → 过期拒绝（AC4）；
+     * expectedFingerprint 为决策时远端版本（会话缓存），不一致同样过期重审（整改 INFO9）。
      */
     async applyDecision(
         sourceKey: string,
         action: "apply-remote" | "keep-local" | "manual-merge" | "save-copy" | "defer",
         manualText: string | undefined,
         expectedLocal: string,
+        expectedFingerprint?: string,
     ): Promise<ApplyResult> {
         const ref = parseSourceKey(sourceKey);
         const store = this.#bookStore(ref.bookId);
@@ -1077,6 +1070,25 @@ export class SyncEngine {
         const item = state.items[sourceKey];
         if (item === undefined || item.pendingRemote === undefined || item.blockId === undefined) {
             return { ok: false, kind: "not-found", message: "该条目没有待审变更" };
+        }
+        if (
+            expectedFingerprint !== undefined &&
+            item.pendingRemote.fingerprint !== expectedFingerprint
+        ) {
+            // 审阅整改 INFO9：会话期内远端刷新（又同步过）→ 过期重审，不静默应用最新版
+            return {
+                ok: false,
+                kind: "stale",
+                message: "远端内容已更新（期间发生过同步），请重新审阅最新版本",
+            };
+        }
+        if (item.status !== "active") {
+            // 审阅整改 M4：隔离/已删/移出条目禁止经决策路径写入（防绕过多块歧义保护）
+            return {
+                ok: false,
+                kind: "not-found",
+                message: `该条目处于 ${item.status} 状态，不可自动应用决策；请先处理该状态`,
+            };
         }
         const oplog = await this.#loadOpLog();
         if (action === "defer") {
@@ -1124,13 +1136,13 @@ export class SyncEngine {
                 return { ok: false, kind: "kernel", message: `副本写入失败：${(e as Error).message}` };
             }
         }
-        // apply-remote / manual-merge → §3 受控原位更新
+        // apply-remote / manual-merge → §3 受控原位更新。
+        // manual-merge 裁决（审阅整改 B1）：manualText 即最终 markdown（UI 预填远端渲染文本），
+        // 仅 trim 规范化、不做二次渲染——"预填→确认"幂等，用户对合并结果有完全控制权
         const newRendered =
             action === "apply-remote"
                 ? item.pendingRemote.renderedText
-                : item.kind === "highlight"
-                  ? renderHighlightBlock(manualText ?? "")
-                  : renderReviewChild(manualText ?? "");
+                : renderManualMerge(item.localBaseline ?? "", manualText ?? "");
         // 基线推进统一以"已处理的远端版本"为准（manual-merge 亦是审阅了该远端版本的结果），
         // 否则手动合并的指纹永不匹配来源 → 永续候选
         const remoteFingerprint = item.pendingRemote.fingerprint;
@@ -1178,7 +1190,8 @@ export class SyncEngine {
             ts: this.#now(),
             intent: "update-block",
             sourceKey,
-            payloadText: `${currentStripped} ⇒ ${newRendered}`.slice(0, 400),
+            beforeText: currentStripped,
+            afterText: newRendered,
             status: "pending",
         });
         try {
@@ -1238,7 +1251,7 @@ export class SyncEngine {
     ): Promise<{ state: BookSyncState; quarantined: number }> {
         let quarantined = 0;
         let changed = false;
-        for (const item of Object.values(state.items)) {
+        for (const [sourceKey, item] of Object.entries(state.items)) {
             const pending = item.pendingUpdate;
             if (pending === undefined || item.blockId === undefined) {
                 continue;
@@ -1252,8 +1265,12 @@ export class SyncEngine {
                 continue;
             }
             const stripped = stripIal(kramdown);
-            if (stripped === pending.after) {
-                // 更新已落地：补记账推进基线（指纹推进到决策对应的远端版本，防永续候选）
+            if (
+                stripped === pending.after &&
+                this.#extractIalAttr(kramdown, "custom-wrs-src") === sourceKey
+            ) {
+                // 更新已落地且身份保持：补记账推进基线（审阅整改 M2：收养须补完身份验证——
+                // 否则丢身份的块被当健康块收养，对审计/重建 SQL 永久不可见）
                 item.renderedText = pending.after;
                 item.localBaseline = stripped;
                 item.sourcePayload = pending.remotePayload;
@@ -1266,6 +1283,7 @@ export class SyncEngine {
                 item.pendingUpdate = undefined;
                 changed = true;
             } else {
+                // 内容落地但身份丢失，或不可解释状态 → 隔离待人工裁决
                 item.status = "quarantined";
                 item.pendingUpdate = undefined;
                 quarantined += 1;

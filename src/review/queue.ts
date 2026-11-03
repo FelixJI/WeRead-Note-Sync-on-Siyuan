@@ -19,6 +19,7 @@ type DecisionAction = "apply-remote" | "keep-local" | "manual-merge" | "save-cop
 
 let engineRef: SyncEngine | undefined;
 const expectedLocalCache = new Map<string, string>();
+const expectedFingerprintCache = new Map<string, string>();
 
 export function initReviewSession(deps: ReviewSessionDeps): void {
     engineRef = deps.engine;
@@ -39,10 +40,12 @@ export async function buildReviewQueue(): Promise<{ items: ReviewCandidate[] }> 
     for (const key of [...expectedLocalCache.keys()]) {
         if (!alive.has(key)) {
             expectedLocalCache.delete(key);
+            expectedFingerprintCache.delete(key);
         }
     }
     for (const item of items) {
         expectedLocalCache.set(item.sourceKey, item.local);
+        expectedFingerprintCache.set(item.sourceKey, item.remoteFingerprint);
     }
     return { items };
 }
@@ -56,9 +59,16 @@ export async function applyDecision(
     if (expected === undefined) {
         return { ok: false, kind: "stale", message: "决策快照缺失（队列已刷新），请重新审阅" };
     }
-    const result = await requireEngine().applyDecision(sourceKey, action, manualText, expected);
+    const result = await requireEngine().applyDecision(
+        sourceKey,
+        action,
+        manualText,
+        expected,
+        expectedFingerprintCache.get(sourceKey),
+    );
     if (result.ok) {
         expectedLocalCache.delete(sourceKey);
+        expectedFingerprintCache.delete(sourceKey);
     }
     return result;
 }

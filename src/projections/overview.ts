@@ -432,6 +432,7 @@ async function resolveOverviewDoc(ctx: ProjectionCtx): Promise<{ docId: string; 
         payloadText: `createDocWithMd /${ctx.texts.overviewDocTitle}`,
         status: "pending",
     });
+    let createdId = "";
     try {
         const docId = await writer.createBookDoc(ctx.deps.notebookId, ctx.texts.overviewDocTitle);
         await writer.setBlockAttrs(docId, {
@@ -448,6 +449,7 @@ async function resolveOverviewDoc(ctx: ProjectionCtx): Promise<{ docId: string; 
         }
         await ctx.deps.oplog.complete(opId, { blockId: docId });
         ctx.countWrite();
+        createdId = docId;
     } catch (e) {
         await ctx.deps.oplog.fail(opId, (e as Error).message);
         throw new ProjectionStopError(`总览文档创建失败：${(e as Error).message}`);
@@ -455,9 +457,7 @@ async function resolveOverviewDoc(ctx: ProjectionCtx): Promise<{ docId: string; 
     if (lost) {
         ctx.anomalies.push("总览文档曾丢失，已重建骨架（用户复盘区重建为占位文本）");
     }
-    return { docId: "", created: true, ...(await Promise.resolve({})) } as { docId: string; created: boolean }
-        ? { docId: (await writer.sql(`select id from blocks where type='d' and ial like '%custom-wrs-overview="1"%' escape '\\' and ial like '%custom-wrs-account="${likeEscape(ns)}"%' escape '\\'`))[0]?.id ?? "", created: true }
-        : { docId: "", created: true };
+    return { docId: createdId, created: true };
 }
 
 /** 骨架区确保：按 custom-wrs-section 找/建；歧义 → undefined（已上报） */

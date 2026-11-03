@@ -13,8 +13,10 @@ import {
     type BookScript,
     type FakeBlock,
 } from "../sync/engine.test";
+import type { KernelCallFn } from "../../src/adapters/siyuan/writer";
 import {
     formatBookEntryLabel,
+    formatBookMetaLine,
     formatRecentExcerptLabel,
 } from "../../src/projections/overview";
 
@@ -23,11 +25,11 @@ const NS = "测试账号";
 
 function makeDeps(
     books: Record<string, BookScript>,
-    overviewFields?: { readingProgress?: number; markedStatus?: number },
+    overviewFields?: { readingProgress?: number; markedStatus?: number; author?: string },
 ) {
     const transport = new FakeTransport(books);
     if (overviewFields !== undefined) {
-        // 向 /user/notebooks 回包注入 readingProgress/markedStatus（NotebookSummaryEntry 契约字段）
+        // 向 /user/notebooks 回包注入 readingProgress/markedStatus/author（NotebookSummaryEntry 契约字段）
         const origPost = transport.post.bind(transport);
         transport.post = async (url: string, body: unknown) => {
             const req = body as Record<string, unknown>;
@@ -40,6 +42,10 @@ function makeDeps(
                     }
                     if (overviewFields.markedStatus !== undefined) {
                         entry.markedStatus = overviewFields.markedStatus;
+                    }
+                    if (overviewFields.author !== undefined) {
+                        // 官方契约：author 嵌套在 books[].book
+                        (entry.book as Record<string, unknown>).author = overviewFields.author;
                     }
                 }
                 return { ...resp, body: JSON.stringify(parsed) };
@@ -471,5 +477,231 @@ describe("T04 原生阅读总览投影", () => {
         expect(r.projectionErrors).toBeUndefined();
         expect(overviewDocs(kernel).length).toBe(0);
         expect(kernel.allBlocks().some((b) => b.ial["custom-wrs-section"] !== undefined)).toBe(false);
+    });
+
+    // ---------- PR11 评审整改 ----------
+
+    it("PR11[1]：作者名含图片/链接/强调/代码等 Markdown 元字符 → meta 行按字面全角文本输出", () => {
+        const line = formatBookMetaLine({
+            title: "T",
+            author: "![tracking](https://example.com/pixel) [l](siyuan://blocks/x) *b* `c` <i> & \"q\" {:ks} $m$ ~~s~~",
+            progressPercent: 10,
+            finished: false,
+            syncedAt: "2026-11-03T00:00:00Z",
+        });
+        expect(line).not.toMatch(/!\[/u); // 不再构成图片语法
+        expect(line).not.toMatch(/\]\(/u); // 不再构成链接语法
+        expect(line).not.toContain("*");
+        expect(line).not.toContain("`");
+        expect(line).not.toContain("<");
+        expect(line).not.toContain("$");
+        expect(line).not.toContain("~");
+        // 恶意作者名以字面文本呈现（全角化，语义不变）
+        expect(line).toContain("！［tracking］（https://example.com/pixel）");
+        expect(line).toContain("［l］（siyuan://blocks/x）");
+        expect(line).toContain("＊b＊");
+        expect(line).toContain("｀c｀");
+        expect(line).toContain("＜i＞");
+        expect(line).toContain("＆ ＂q＂");
+        expect(line).toContain("｛:ks｝");
+        expect(line).toContain("＄m＄");
+        expect(line).toContain("～～s～～");
+    });
+
+    it("PR11[1]：远端恶意作者名 → meta 块按字面文本写入，两轮幂等无安全停", async () => {
+        const books = fixture();
+        const deps = makeDeps(books, { author: "![tracking](https://example.com/pixel)" });
+        const r1 = await deps.engine.syncRound();
+        expect(r1.ok).toBe(true);
+        expect(r1.projectionErrors).toBeUndefined();
+        const bookDoc = bookDocOf(deps.kernel, "10001");
+        const metas = metaBlocks(deps.kernel, bookDoc.id);
+        expect(metas.length).toBe(1);
+        expect(metas[0]!.markdown).not.toContain("![");
+        expect(metas[0]!.markdown).not.toContain("](");
+        expect(metas[0]!.markdown).toContain("！［tracking］（https://example.com/pixel）");
+        const r2 = await deps.engine.syncRound();
+        expect(r2.ok).toBe(true);
+        expect(r2.projectionErrors).toBeUndefined(); // 回读全等成立，无死循环
+    });
+
+    it("PR11[2] 回归：SQL 索引滞后（总览身份查询空结果）→ 创建成功仍返回已验证 docId", async () => {
+        const books = fixture();
+        const transport = new FakeTransport(books);
+        const kernel = new FakeKernel();
+        const persistence = new MemoryPersistence();
+        // 模拟索引滞后：所有含 custom-wrs-overview="1" 的身份查询暂返回空
+        const laggedKernel: KernelCallFn = async (path, data) => {
+            if (path === "/api/query/sql") {
+                const sql = String((data as { sql?: unknown }).sql ?? "");
+                if (sql.includes('custom-wrs-overview="1"')) {
+                    return { code: 0, msg: "", data: [] };
+                }
+            }
+            return kernel.call(path, data);
+        };
+        let seq = 0;
+        const engine = new SyncEngine({
+            persistence,
+            kernel: laggedKernel,
+            transport,
+            apiKey: KEY,
+            accountNamespace: NS,
+            now: () => "2026-11-03T00:00:00Z",
+            newOpId: () => `op-${String((seq += 1)).padStart(4, "0")}`,
+        });
+        const r1 = await engine.syncRound();
+        expect(r1.ok).toBe(true);
+        expect(r1.projectionErrors).toBeUndefined(); // 创建+回读已验证，不依赖 SQL 可见性
+        const ov = kernel.allBlocks().find((b) => b.type === "d" && b.ial["custom-wrs-overview"] === "1");
+        expect(ov).toBeDefined();
+        for (const s of ["stats", "books", "recent", "notes"]) {
+            expect(sectionBlock(kernel, ov!.id, s)).toBeDefined(); // 骨架完整
+        }
+        const idx = persistence.store.get("index") as { overviewDocId?: string };
+        expect(idx.overviewDocId).toBe(ov!.id); // 保存的是已验证 docId，而非 SQL 二查的空结果
+        // 第二轮（缓存命中路径）在滞后 SQL 下仍正常
+        const r2 = await engine.syncRound();
+        expect(r2.ok).toBe(true);
+        expect(r2.projectionErrors).toBeUndefined();
+    });
+
+    it("PR11[4]：缓存命中仍做重复身份检查——复制总览（带属性）→ 歧义安全停", async () => {
+        const books = fixture();
+        const deps = makeDeps(books);
+        await deps.engine.syncRound();
+        const ov = overviewDoc(deps.kernel);
+        // 用户复制总览文档（身份属性随副本带走）→ 两份 custom-wrs-overview 身份
+        const copy: FakeBlock = {
+            id: "ov-copy",
+            type: "d",
+            content: ov.content,
+            markdown: ov.markdown,
+            ial: { ...ov.ial, id: "ov-copy" },
+            parentId: null,
+            rootId: "ov-copy",
+            box: ov.box,
+            children: [],
+        };
+        deps.kernel.blocks.set(copy.id, copy);
+
+        books["10001"]!.title = "若未安全停会被写入条目的新标题";
+        const r2 = await deps.engine.syncRound();
+        expect(r2.ok).toBe(true); // 同步本体不受影响
+        expect(r2.projectionErrors).toBe(1);
+        expect(r2.projectionAnomalies?.some((a) => a.includes("多份总览"))).toBe(true);
+        // 安全停：缓存副本的条目未被更新为伪新标题
+        const entry = entryBlocks(deps.kernel, ov.id).find((b) => b.ial["custom-wrs-entry"] === "10001")!;
+        expect(entry.markdown).toContain("三体");
+        // 复制副本未被写入任何骨架
+        expect(sectionBlock(deps.kernel, "ov-copy", "stats")).toBeUndefined();
+        expect(sectionBlock(deps.kernel, "ov-copy", "notes")).toBeUndefined();
+    });
+
+    it("PR11[6]：SQL 恢复路径校验归属——属性被清但索引滞留旧值 → 安全停不写", async () => {
+        const books = fixture();
+        const transport = new FakeTransport(books);
+        const kernel = new FakeKernel();
+        const persistence = new MemoryPersistence();
+        // 第二轮起注入"索引滞留"：总览身份查询仍返回旧 doc 行
+        let staleRows: Array<{ id: string }> | undefined;
+        const wrappedKernel: KernelCallFn = async (path, data) => {
+            if (path === "/api/query/sql" && staleRows !== undefined) {
+                const sql = String((data as { sql?: unknown }).sql ?? "");
+                if (sql.includes('custom-wrs-overview="1"')) {
+                    return { code: 0, msg: "", data: staleRows };
+                }
+            }
+            return kernel.call(path, data);
+        };
+        let seq = 0;
+        const engine = new SyncEngine({
+            persistence,
+            kernel: wrappedKernel,
+            transport,
+            apiKey: KEY,
+            accountNamespace: NS,
+            now: () => "2026-11-03T00:00:00Z",
+            newOpId: () => `op-${String((seq += 1)).padStart(4, "0")}`,
+        });
+        await engine.syncRound();
+        const ov = kernel.allBlocks().find((b) => b.ial["custom-wrs-overview"] === "1")!;
+        expect(ov).toBeDefined();
+        // 用户清除身份属性（缓存路径回读即失配）+ SQL 索引仍滞留旧值
+        delete ov.ial["custom-wrs-overview"];
+        staleRows = [{ id: ov.id }];
+
+        books["10001"]!.title = "若归属失守会被写入条目的新标题";
+        const r2 = await engine.syncRound();
+        expect(r2.ok).toBe(true);
+        expect(r2.projectionErrors).toBeGreaterThanOrEqual(1);
+        expect(r2.projectionAnomalies?.some((a) => a.includes("SQL 索引不符"))).toBe(true);
+        // 失属文档未被写入任何总览更新：条目仍是旧标题
+        const entry = kernel.allBlocks().filter((b) => b.ial["custom-wrs-entry"] === "10001")[0]!;
+        expect(entry.markdown).toContain("三体");
+        // 未重建第二份总览文档
+        expect(kernel.allBlocks().filter((b) => b.type === "d").length).toBe(2);
+    });
+
+    it("PR11[7]：首轮 notes 创建失败 → 下轮补建骨架而非误报用户删除；初始化完成后删除仍按删除纪律", async () => {
+        const books = fixture();
+        const transport = new FakeTransport(books);
+        const kernel = new FakeKernel();
+        const persistence = new MemoryPersistence();
+        // 注入一次失败：复盘区（custom-wrs-section="notes"）创建中断（文档已建成）
+        let failNotesOnce = true;
+        const wrappedKernel: KernelCallFn = async (path, data) => {
+            if (path === "/api/block/appendBlock" && failNotesOnce) {
+                const md = String((data as { data?: unknown }).data ?? "");
+                if (md.includes('custom-wrs-section="notes"')) {
+                    failNotesOnce = false;
+                    return { code: -1, msg: "注入：复盘区创建失败" };
+                }
+            }
+            return kernel.call(path, data);
+        };
+        let seq = 0;
+        const engine = new SyncEngine({
+            persistence,
+            kernel: wrappedKernel,
+            transport,
+            apiKey: KEY,
+            accountNamespace: NS,
+            now: () => "2026-11-03T00:00:00Z",
+            newOpId: () => `op-${String((seq += 1)).padStart(4, "0")}`,
+        });
+
+        const r1 = await engine.syncRound();
+        expect(r1.ok).toBe(true);
+        expect(r1.projectionErrors).toBe(1); // 投影安全停：notes 创建失败
+        const ov = kernel.allBlocks().find((b) => b.ial["custom-wrs-overview"] === "1")!;
+        expect(ov).toBeDefined();
+        expect(sectionBlock(kernel, ov.id, "stats")).toBeDefined(); // stats 已建（notes 之前）
+        expect(sectionBlock(kernel, ov.id, "notes")).toBeUndefined(); // notes 确实未建成
+
+        const r2 = await engine.syncRound();
+        expect(r2.ok).toBe(true);
+        expect(r2.projectionErrors).toBeUndefined();
+        // 初始化未完成 → 补建复盘区，绝不误报"疑似被用户删除"
+        expect(r2.projectionAnomalies?.some((a) => a.includes("疑似被用户删除"))).toBe(false);
+        expect(r2.projectionAnomalies?.some((a) => a.includes("初始化未完成"))).toBe(true);
+        for (const s of ["stats", "books", "recent", "notes"]) {
+            expect(sectionBlock(kernel, ov.id, s)).toBeDefined(); // 骨架补建完成
+        }
+        expect(ov.ial["custom-wrs-init"]).toBe("done"); // 初始化完成标记落盘
+
+        const r3 = await engine.syncRound();
+        expect(r3.ok).toBe(true);
+        expect(r3.projectionErrors).toBeUndefined();
+        expect(r3.projectionAnomalies ?? []).toEqual([]); // 稳态零异常、零误报
+
+        // 初始化完成后用户删除复盘区 → 按删除纪律：不自动复活、如实上报（AGENTS.md L19）
+        const notes = sectionBlock(kernel, ov.id, "notes")!;
+        kernel.blocks.delete(notes.id);
+        const r4 = await engine.syncRound();
+        expect(r4.ok).toBe(true);
+        expect(r4.projectionErrors).toBeUndefined();
+        expect(r4.projectionAnomalies?.some((a) => a.includes("疑似被用户删除"))).toBe(true);
+        expect(sectionBlock(kernel, ov.id, "notes")).toBeUndefined(); // 未复活
     });
 });

@@ -7,6 +7,7 @@ import {
     GatewayError,
     TransportError,
     UpgradeRequiredError,
+    executeGatewayCall,
     parseGatewayJson,
 } from "../../src/adapters/weread/gateway";
 
@@ -139,6 +140,43 @@ describe("微信读书网关契约", () => {
         );
         expect(err).toBeInstanceOf(UpgradeRequiredError);
         expect(err).not.toBeInstanceOf(AuthError);
+    });
+
+    it("upgrade_info 为非对象真值（字符串）→ 字段出现即暂停，仍抛 UpgradeRequiredError", async () => {
+        const t = fakeTransport(() =>
+            jsonBody({ errcode: 0, upgrade_info: "请升级技能版本" }),
+        );
+        const client = createWereadClient(t, KEY);
+        const err = await client.listNotebooksPage({ count: 1 }).then(
+            () => undefined,
+            (e: unknown) => e,
+        );
+        expect(err).toBeInstanceOf(UpgradeRequiredError);
+        const ue = err as UpgradeRequiredError;
+        expect(ue.serverMessage).toBe("");
+    });
+
+    it("upgrade_info 为 null（字段显式出现）→ 仍抛 UpgradeRequiredError", async () => {
+        const t = fakeTransport(() => jsonBody({ errcode: 0, upgrade_info: null }));
+        const client = createWereadClient(t, KEY);
+        const err = await client.listNotebooksPage({ count: 1 }).then(
+            () => undefined,
+            (e: unknown) => e,
+        );
+        expect(err).toBeInstanceOf(UpgradeRequiredError);
+    });
+
+    it("业务参数含 api_name/skill_version 同名键 → 协议字段固化不被覆盖", async () => {
+        const t = fakeTransport(() => jsonBody({ errcode: 0, books: [], hasMore: 0 }));
+        await executeGatewayCall(t, KEY, "/user/notebooks", {
+            count: 1,
+            api_name: "/evil",
+            skill_version: "9.9",
+        });
+        const body = bodyAsRecord(t.calls[0]);
+        expect(body.api_name).toBe("/user/notebooks");
+        expect(body.skill_version).toBe("1.0.5");
+        expect(body.count).toBe(1);
     });
 
     it("非 JSON 响应 → TransportError", async () => {

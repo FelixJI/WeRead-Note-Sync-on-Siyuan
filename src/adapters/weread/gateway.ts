@@ -88,11 +88,12 @@ export async function executeGatewayCall(
     params: Record<string, unknown>,
     timeoutMs: number = DEFAULT_GATEWAY_TIMEOUT_MS,
 ): Promise<Record<string, unknown>> {
-    // 业务参数平铺在顶层，禁止包在 params/data/body 里（契约冻结）
+    // 业务参数平铺在顶层，禁止包在 params/data/body 里（契约冻结）；
+    // 协议字段在展开之后固化，防止调用方 params 意外覆盖 api_name/skill_version
     const body: Record<string, unknown> = {
+        ...params,
         api_name: apiName,
         skill_version: WEREAD_SKILL_VERSION,
-        ...params,
     };
     const headers: Record<string, string> = {
         Authorization: `Bearer ${apiKey}`,
@@ -109,11 +110,14 @@ export async function executeGatewayCall(
 
     const obj = parseGatewayJson(resp.body);
 
-    // upgrade_info 优先于 errcode 判断：契约要求出现即暂停
+    // upgrade_info 优先于 errcode 判断：契约要求"字段出现即暂停"，
+    // 不论其值形态（对象/字符串/null），非对象时 message 取空串
     const upgradeInfo = obj.upgrade_info;
-    if (isRecord(upgradeInfo)) {
+    if (upgradeInfo !== undefined) {
         const serverMessage =
-            typeof upgradeInfo.message === "string" ? upgradeInfo.message : "";
+            isRecord(upgradeInfo) && typeof upgradeInfo.message === "string"
+                ? upgradeInfo.message
+                : "";
         throw new UpgradeRequiredError(
             `微信读书接口要求升级：${redact(serverMessage)}`,
             errcodeOf(obj),

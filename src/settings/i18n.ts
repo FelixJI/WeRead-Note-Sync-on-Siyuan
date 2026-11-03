@@ -22,7 +22,7 @@ export const SETTINGS_TEXT_FALLBACK = {
     settingTestBtn: "测试连接",
     settingTesting: "测试中…",
     settingClearKeyBtn: "清除 Key",
-    settingInvalidKey: "API Key 格式不正确：应以 wrk- 开头，且不含空格或换行。",
+    settingInvalidKey: "API Key 格式不正确：应以 wrk- 开头、总长度不少于 12 个字符，且不含空格或换行。",
     settingTestOk: "连接成功",
     settingBooksWithNotes: "有笔记书籍",
     settingElapsed: "耗时",
@@ -30,7 +30,7 @@ export const SETTINGS_TEXT_FALLBACK = {
     settingFailKindNetwork: "网络错误：无法访问微信读书网关，请检查本机网络后重试。",
     settingFailKindUpgrade: "微信读书要求升级：请按提示升级后再重试。",
     settingFailKindGateway: "网关错误：微信读书网关返回异常，请稍后重试。",
-    settingFailKindInvalidKey: "API Key 无效：应以 wrk- 开头。",
+    settingFailKindInvalidKey: "API Key 无效：应以 wrk- 开头、总长度不少于 12 个字符。",
     settingFailUnexpected: "连接测试出现未预期的错误，请重试。",
     settingKeyCleared: "已清除 API Key（会话内存与本机存储）。",
 } as const;

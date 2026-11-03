@@ -98,8 +98,11 @@ export async function paginateAll<T>(options: PaginateAllOptions<T>): Promise<Pa
         const currentPageKeys = new Set(pageKeys);
         // 回调内无法沿用 let 变量的窄化，先固化到 const
         const prevKeys = prevPageKeys;
+        // 空集不参与"整页重复"判定（两页全为无效条目时空集相等是空真）；
+        // 该场景由游标不前进/继续翻页路径处理
         if (
             prevKeys !== undefined &&
+            currentPageKeys.size > 0 &&
             currentPageKeys.size === prevKeys.size &&
             [...currentPageKeys].every((k) => prevKeys.has(k))
         ) {

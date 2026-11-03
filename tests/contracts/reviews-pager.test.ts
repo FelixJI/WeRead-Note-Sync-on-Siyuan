@@ -91,4 +91,18 @@ describe("想法分页（/review/list/mine）", () => {
         expect(result.reviews.map((r) => r.reviewId)).toEqual(["ok"]);
         expect(result.anomalies.some((a) => a.includes("reviewId"))).toBe(true);
     });
+
+    it("连续两页全部条目无效（空键集）且 synckey 前进 → 不误判整页重复，正常翻页完成", async () => {
+        // 回归：空 Set 相等是空真，曾会把两个空页误判为"整页重复"软停止
+        const t = scriptedTransport([
+            () => jsonBody({ errcode: 0, hasMore: 1, synckey: "s1", reviews: [{ review: {} }] }),
+            () => jsonBody({ errcode: 0, hasMore: 1, synckey: "s2", reviews: [{ review: {} }] }),
+            () => jsonBody({ errcode: 0, hasMore: 0, synckey: "", reviews: [rv("r1")] }),
+        ]);
+        const result = await listAllReviewsForBook(t, KEY, "BID");
+        expect(result.reviews.map((r) => r.reviewId)).toEqual(["r1"]);
+        expect(t.calls).toHaveLength(3);
+        expect(result.anomalies.some((a) => a.includes("reviewId"))).toBe(true);
+        expect(result.anomalies.some((a) => a.includes("整页重复"))).toBe(false);
+    });
 });

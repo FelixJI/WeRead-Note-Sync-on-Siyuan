@@ -494,7 +494,10 @@ export class MemoryPersistence implements StatePersistence {
 
 // ---------- 工具 ----------
 
-function makeDeps(books: Record<string, BookScript>, opts?: { projectOverview?: boolean }) {
+function makeDeps(
+    books: Record<string, BookScript>,
+    opts?: { projectOverview?: boolean; writerIdentity?: { writerId: string; label: string } },
+) {
     const transport = new FakeTransport(books);
     const kernel = new FakeKernel();
     const persistence = new MemoryPersistence();
@@ -508,6 +511,7 @@ function makeDeps(books: Record<string, BookScript>, opts?: { projectOverview?: 
         now: () => "2026-11-03T00:00:00Z",
         newOpId: () => `op-${String((seq += 1)).padStart(4, "0")}`,
         projectOverview: opts?.projectOverview ?? false,
+        ...(opts?.writerIdentity !== undefined ? { writerIdentity: opts.writerIdentity } : {}),
     });
     return { transport, kernel, persistence, engine };
 }
@@ -1297,5 +1301,41 @@ describe("同步引擎：PR 评审意见修复", () => {
         // 最后一本书从书目消失：总览条目被标记“来源未返回”，而非继续显示为最新
         const marked = kernel.allBlocks().filter((b) => (b.markdown ?? "").includes("来源未返回") || (b.content ?? "").includes("来源未返回"));
         expect(marked.length).toBeGreaterThan(0);
+    });
+
+    it("PR#14 评审：跨引擎实例（生产每次同步新建引擎）时，既有章节增量划线仍锚定章节末尾", async () => {
+        const books = fixture();
+        const identity = { writerId: "w-cross-instance", label: "同一客户端" };
+        const { kernel, persistence, transport, engine } = makeDeps(books, { writerIdentity: identity });
+        await engine.syncRound();
+        const ch1Heading = kernel.allBlocks().find((b) => b.type === "h" && b.content === "第1章")!;
+        const h2 = kernel.itemBlocks().find((b) => b.ial["custom-wrs-src"] === srcOf("10001", "highlight", "h2"))!;
+        books["10001"]!.highlights.push({
+            bookmarkId: "h6", chapterUid: 1, markText: "跨实例增量", range: "90-99", createTime: 1700000006,
+        });
+        // 生产路径：每次同步 new SyncEngine（#lastChapterAnchor 为空，不能依赖同轮链式游标）
+        let seq = 500;
+        const engine2 = new SyncEngine({
+            persistence,
+            kernel: kernel.call,
+            transport,
+            apiKey: KEY,
+            accountNamespace: NS,
+            now: () => "2026-11-03T00:00:00Z",
+            newOpId: () => `op2-${String((seq += 1)).padStart(4, "0")}`,
+            projectOverview: false,
+            writerIdentity: identity,
+        });
+        kernel.calls.length = 0;
+        const r2 = await engine2.syncRound();
+        expect(r2.ok).toBe(true);
+        expect(r2.books[0]?.created).toBe(1);
+        const insertH6 = kernel.calls.find(
+            (c) => c.path === "/api/block/insertBlock" && String((c.data as Record<string, unknown>).data ?? "").includes("跨实例增量"),
+        );
+        const previousID = String((insertH6?.data as Record<string, unknown>).previousID);
+        // 锚定在第1章既有划线的末尾（h2 之后），而非章节标题（否则会插到全部既有划线之前）
+        expect(previousID).toBe(h2.id);
+        expect(previousID).not.toBe(ch1Heading.id);
     });
 });

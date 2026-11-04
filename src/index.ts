@@ -86,14 +86,16 @@ export default class WereadNoteSyncPlugin extends Plugin {
     onunload(): void {
         // T06 + PR#13 评审修复：先泄流在途同步写入、再释放写入端租约——
         // 否则他端立即接管后，本轮仍在继续写内核并会把旧租约写回 index，覆盖新端的认领
+        // PR#14 评审修复：释放用引擎必须在 await 之前捕获——泄流期间 dispose() 已清内存 Key，
+        // 之后再 buildEngine() 会得到 null，releaseWriter 永不执行，他端被租约卡满 30 分钟
+        const releaseEngine = this.#buildEngine();
         void (async () => {
             const active = this.#activeWrite;
             if (active !== null) {
                 await active.catch(() => undefined);
             }
-            const engine = this.#buildEngine();
-            if (engine !== null) {
-                await engine.releaseWriter().catch(() => undefined);
+            if (releaseEngine !== null) {
+                await releaseEngine.releaseWriter().catch(() => undefined);
             }
         })();
         // 仅清会话内存；用户勾选“记住”时 localStorage 保留（策略见 api-key-store.ts）

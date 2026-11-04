@@ -1076,10 +1076,15 @@ export class SyncEngine {
                         docId,
                     );
                 } else {
-                    // PR#9 评审修复（既有章节内插入）：章节已存在时同样锚定到该章节内部
-                    // （标题之后），不再落入文档末尾；同轮多条经链式游标保持先后顺序
+                    // PR#9 评审修复（既有章节内插入）：章节已存在时同样锚定到该章节内部，
+                    // 不再落入文档末尾。锚点优先级（PR#14 评审修复）：
+                    // 1) 本轮链式游标（同轮多条保序）；
+                    // 2) 持久化状态中该章节最后一条既有划线——生产环境每次同步新建引擎、
+                    //    游标恒为空，若回退到章节标题会把增量划线插到全部既有划线之前；
+                    // 3) 章节标题块。
                     anchorId =
                         this.#lastChapterAnchor.get(`${docId}|${create.chapter.title}`) ??
+                        this.#lastPersistedChapterAnchor(state, create.chapter) ??
                         existing[0]?.id;
                 }
             }
@@ -1703,6 +1708,44 @@ export class SyncEngine {
      *  会静默改绑第一本书的身份属性）。writer 层 DocPathCollisionError 为第二道防线。 */
     #docTitle(title: string, bookId: string): string {
         return `${sanitizeDocTitle(title, bookId)} (${bookId})`;
+    }
+
+    /**
+     * PR#14 评审修复：从持久化书状态恢复章节内插入锚点——取该章节（chapterUid 相同）
+     * 内 active 划线按 plan 同序（rangeStart → createTime → sourceKey）排序的最后一条
+     * blockId。收养/重建条目 sourcePayload 为空（无章节信息）时自然跳过。
+     */
+    #lastPersistedChapterAnchor(
+        state: BookSyncState,
+        chapter: { uid?: number },
+    ): string | undefined {
+        if (chapter.uid === undefined) {
+            return undefined;
+        }
+        const uid = chapter.uid;
+        let best: { key: string; blockId: string; rangeStart: number; createTime: number } | undefined;
+        for (const [key, item] of Object.entries(state.items)) {
+            if (item.kind !== "highlight" || item.status !== "active" || typeof item.blockId !== "string") {
+                continue;
+            }
+            const raw = item.sourcePayload;
+            if (typeof raw.chapterUid !== "number" || raw.chapterUid !== uid) {
+                continue;
+            }
+            // 与 model.parseRangeStart 同语义：range "2959-3007" → 2959；缺失记 Infinity（殿后）
+            const rangeMatch = typeof raw.range === "string" ? /^(\d+)/.exec(raw.range.trim()) : null;
+            const rangeStart = rangeMatch !== null ? Number(rangeMatch[1]) : Number.POSITIVE_INFINITY;
+            const createTime = typeof raw.createTime === "number" ? raw.createTime : Number.POSITIVE_INFINITY;
+            if (
+                best === undefined ||
+                rangeStart > best.rangeStart ||
+                (rangeStart === best.rangeStart && (createTime > best.createTime ||
+                    (createTime === best.createTime && key > best.key)))
+            ) {
+                best = { key, blockId: item.blockId, rangeStart, createTime };
+            }
+        }
+        return best?.blockId;
     }
 
     #withItem(state: BookSyncState, key: string, mut: (item: ItemState) => void): BookSyncState {

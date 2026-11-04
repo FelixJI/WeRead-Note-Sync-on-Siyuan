@@ -704,4 +704,45 @@ describe("T04 原生阅读总览投影", () => {
         expect(r4.projectionAnomalies?.some((a) => a.includes("疑似被用户删除"))).toBe(true);
         expect(sectionBlock(kernel, ov.id, "notes")).toBeUndefined(); // 未复活
     });
+
+    it("PR#14 评审：legacy 总览（无 custom-wrs-init）缺失复盘区 → 按删除纪律不重建（升级前用户已删场景）", async () => {
+        const books = fixture();
+        const { kernel, engine } = makeDeps(books);
+        await engine.syncRound(); // 新代码建成完整总览并落 done
+        const ov = overviewDoc(kernel);
+        expect(ov.ial["custom-wrs-init"]).toBe("done");
+        // 模拟升级前旧文档：抹掉初始化标记；复盘区在升级前已被用户删除
+        delete ov.ial["custom-wrs-init"];
+        kernel.blocks.delete(sectionBlock(kernel, ov.id, "notes")!.id);
+
+        const r2 = await engine.syncRound();
+        expect(r2.ok).toBe(true);
+        expect(r2.projectionErrors).toBeUndefined();
+        // 旧文档无"初始化中断"正证据 → 绝不因缺标记重建用户已删除的复盘区
+        expect(r2.projectionAnomalies?.some((a) => a.includes("疑似被用户删除"))).toBe(true);
+        expect(r2.projectionAnomalies?.some((a) => a.includes("初始化未完成"))).toBe(false);
+        expect(sectionBlock(kernel, ov.id, "notes")).toBeUndefined(); // 未复活
+        expect(ov.ial["custom-wrs-init"]).toBeUndefined(); // 骨架不完整不落 done，保持既有纪律
+    });
+
+    it("PR#14 评审：legacy 总览骨架完整 → 收编落 done；此后删除复盘区仍按删除纪律", async () => {
+        const books = fixture();
+        const { kernel, engine } = makeDeps(books);
+        await engine.syncRound();
+        const ov = overviewDoc(kernel);
+        // 模拟升级前旧文档（骨架完整，仅缺标记）
+        delete ov.ial["custom-wrs-init"];
+
+        const r2 = await engine.syncRound();
+        expect(r2.ok).toBe(true);
+        expect(r2.projectionAnomalies ?? []).toEqual([]); // 完整骨架不误报、不补建
+        expect(ov.ial["custom-wrs-init"]).toBe("done"); // 收编入新机制
+
+        // 收编后删除复盘区 → 与新文档同一删除纪律（不复活）
+        kernel.blocks.delete(sectionBlock(kernel, ov.id, "notes")!.id);
+        const r3 = await engine.syncRound();
+        expect(r3.ok).toBe(true);
+        expect(r3.projectionAnomalies?.some((a) => a.includes("疑似被用户删除"))).toBe(true);
+        expect(sectionBlock(kernel, ov.id, "notes")).toBeUndefined();
+    });
 });

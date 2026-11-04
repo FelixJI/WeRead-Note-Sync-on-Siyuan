@@ -22,7 +22,8 @@ export interface PlanCreate {
     payload: Record<string, unknown>;
     /** plan 用 kramdown 渲染函数产出的最终 markdown */
     renderedText: string;
-    chapter: { idx: number; title: string } | undefined;
+    /** 章节定位（uid 供引擎跨实例恢复章节内插入锚点——PR#14 评审修复） */
+    chapter: { idx: number; title: string; uid?: number } | undefined;
     /** 挂靠目标的 highlight bookmarkId（未挂靠则缺省） */
     matchedHighlightBlockHint?: string;
 }
@@ -97,9 +98,9 @@ function compareStandaloneReviews(a: NormalizedReview, b: NormalizedReview): num
     return 0;
 }
 
-function chapterOfHighlight(h: NormalizedHighlight): { idx: number; title: string } | undefined {
+function chapterOfHighlight(h: NormalizedHighlight): { idx: number; title: string; uid?: number } | undefined {
     if (h.chapterIdx === undefined) return undefined;
-    return { idx: h.chapterIdx, title: h.chapterTitle ?? "" };
+    return { idx: h.chapterIdx, title: h.chapterTitle ?? "", uid: h.chapterUid };
 }
 
 export function computePlan(args: {
@@ -254,7 +255,7 @@ export function computePlan(args: {
     const pushReviewCreate = (
         r: NormalizedReview,
         sourceKey: string,
-        chapter: { idx: number; title: string } | undefined,
+        chapter: { idx: number; title: string; uid?: number } | undefined,
         hint: string | undefined,
     ): void => {
         const create: PlanCreate = {

@@ -18,7 +18,8 @@
  * - 任何写失败 → 安全停（本轮投影中止，不影响同步本体结果；引擎捕获计为 warning）。
  * - 用户复盘区（notes）创建后投影永不触碰；总览丢失 → 重建骨架并如实上报（复盘区重建为占位）。
  *   骨架四区（stats/books/recent/notes）首次全部建成后落盘 custom-wrs-init="done" 标记，
- *   区分"初始化未完成"（补建骨架，PR11[7]）与"初始化已完成后复盘区缺失"（用户删除，不复活）。
+ *   区分"初始化未完成"（仅 custom-wrs-init="pending" 正证据，补建骨架，PR11[7]+PR#14 评审修复）
+ *   与"初始化已完成后/旧版文档复盘区缺失"（疑似用户删除，不复活；升级前旧文档无标记，同此纪律）。
  */
 import { likeEscape, type SiyuanWriter } from "../adapters/siyuan/writer";
 import type { OpLog } from "../sync/oplog";
@@ -418,12 +419,16 @@ async function updateProjectionBlock(
 
 /**
  * 总览文档定位/创建：index 缓存（回读核实 + 重复身份检查）→ 属性 SQL 找回（回读验归属）→ 重建骨架。
- * initDone：custom-wrs-init="done" 标记（骨架四区首次全部建成后落盘）——
- * 区分"初始化未完成"（补建骨架）与"用户本地删除复盘区"（不复活，AGENTS.md L19）。
+ * init 三态（PR#14 评审修复）：custom-wrs-init="done"（骨架四区建成后落盘）/"pending"（新代码创建时
+ * 即写入、骨架未完成）/"legacy"（属性缺失=升级前创建的旧文档）。补建复盘区只认 "pending"
+ * 这类**正证据**的初始化中断；legacy 文档缺失复盘区一律按既有纪律疑似用户删除处理（不复活，
+ * AGENTS.md L19）——旧文档绝不能因缺标记被当成"未完成初始化"而重建用户已删除内容。
  */
+type OverviewInitState = "pending" | "done" | "legacy";
+
 async function resolveOverviewDoc(
     ctx: ProjectionCtx,
-): Promise<{ docId: string; created: boolean; initDone: boolean }> {
+): Promise<{ docId: string; created: boolean; init: OverviewInitState }> {
     const { writer, index } = ctx.deps;
     const ns = index.accountNamespace;
     if (index.overviewDocId !== undefined) {
@@ -443,7 +448,7 @@ async function resolveOverviewDoc(
                     );
                 }
             }
-            return { docId: cachedId, created: false, initDone: isInitDone(kramdown) };
+            return { docId: cachedId, created: false, init: initStateOf(kramdown) };
         }
     }
     const rows = await findOverviewDocIds(ctx);
@@ -461,7 +466,7 @@ async function resolveOverviewDoc(
                     "总览文档归属校验失败（custom-wrs-overview/custom-wrs-account 与 SQL 索引不符，疑似属性被清除或篡改），投影安全停",
                 );
             }
-            return { docId, created: false, initDone: isInitDone(kramdown) };
+            return { docId, created: false, init: initStateOf(kramdown) };
         }
         // SQL 命中但回读失败（索引滞后或已删）：不写该块，走重建
     }
@@ -479,9 +484,9 @@ async function resolveOverviewDoc(
                 `select id from blocks where root_id='${esc(cand)}' and id != '${esc(cand)}'`,
             );
             if (children.length === 0) {
-                await writer.setBlockAttrs(cand, { "custom-wrs-overview": "1", "custom-wrs-account": ns });
+                await writer.setBlockAttrs(cand, { "custom-wrs-overview": "1", "custom-wrs-account": ns, "custom-wrs-init": "pending" });
                 ctx.anomalies.push("认领了创建中断遗留的空总览孤儿文档");
-                return { docId: cand, created: true, initDone: false };
+                return { docId: cand, created: true, init: "pending" };
             }
         }
     }
@@ -499,6 +504,8 @@ async function resolveOverviewDoc(
         await writer.setBlockAttrs(docId, {
             "custom-wrs-overview": "1",
             "custom-wrs-account": ns,
+            // 创建即写 pending：骨架中断的唯一正证据（legacy 文档无此标记，见 OverviewInitState）
+            "custom-wrs-init": "pending",
         });
         const kramdown = await writer.getBlockKramdown(docId);
         if (kramdown === undefined || !isOverviewOwner(kramdown, ns)) {
@@ -516,7 +523,7 @@ async function resolveOverviewDoc(
     }
     // PR11[2] 整改（已落地，此为契约注释）：创建且回读已验证后直接返回该 docId，
     // 不再以 SQL 二次查询取 docId——SQL 索引滞后时会拿到空结果，破坏骨架创建与缓存。
-    return { docId: createdId, created: true, initDone: false };
+    return { docId: createdId, created: true, init: "pending" };
 }
 
 /** 按 custom-wrs-overview="1" + 账号命名空间查总览文档块 ID（SQL 仅为线索，存在性以回读为准） */
@@ -539,6 +546,19 @@ function isOverviewOwner(kramdown: string, ns: string): boolean {
 /** 初始化完成标记（custom-wrs-init="done"）：骨架四区首次全部建成后落盘 */
 function isInitDone(kramdown: string): boolean {
     return extractIalAttr(kramdown, "custom-wrs-init") === "done";
+}
+
+/** PR#14 评审修复：初始化三态——done=已完成；pending=新代码创建但骨架未完成（可补建的
+ * 唯一正证据）；legacy=属性缺失（升级前旧文档，缺失复盘区按既有删除纪律，不重建）。 */
+function initStateOf(kramdown: string): OverviewInitState {
+    const v = extractIalAttr(kramdown, "custom-wrs-init");
+    if (v === "done") {
+        return "done";
+    }
+    if (v !== undefined) {
+        return "pending";
+    }
+    return "legacy";
 }
 
 /**
@@ -673,15 +693,16 @@ export async function projectOverview(deps: ProjectOverviewDeps): Promise<Projec
         const statsSectionId = await ensureSection(ctx, resolved.docId, "stats", texts.statsPlaceholder);
 
         // 用户复盘区：存在即永不触碰（AC3）；首建随骨架创建。
-        // PR11[7] 整改：区分"初始化未完成"（custom-wrs-init 标记未落盘 → 骨架此前创建中断，
-        // 补建而非误报删除）与"初始化已完成后缺失"（疑似用户删除 → 不自动复活，如实上报）。
+        // PR11[7] 整改 + PR#14 评审修复：只有 "pending"（新代码创建、骨架中断）才补建；
+        // "done" 后缺失 = 疑似用户删除（不自动复活，如实上报）；"legacy"（升级前旧文档，
+        // 无初始化正证据）缺失同样按删除纪律——绝不因缺标记重建用户已删除内容（AGENTS.md L19）。
         let notesPresent = false;
         const notesIds = await findAttrBlockIds(ctx, resolved.docId, "custom-wrs-section", "notes");
         if (notesIds.length === 1) {
             notesPresent = true; // 投影永不触碰
         } else if (notesIds.length > 1) {
             anomalies.push("复盘区属性歧义（多块），未触碰");
-        } else if (resolved.created || !resolved.initDone) {
+        } else if (resolved.created || resolved.init === "pending") {
             await createProjectionBlock(ctx, resolved.docId, texts.notesSectionHint, {
                 "custom-wrs-section": "notes",
             });
@@ -762,10 +783,12 @@ export async function projectOverview(deps: ProjectOverviewDeps): Promise<Projec
             }
         }
 
-        // ---- 5. 初始化完成标记（PR11[7]）：骨架四区俱全 → 首次一次性落盘 custom-wrs-init ----
-        // 此后复盘区缺失即按用户删除纪律处理（不自动复活，AGENTS.md L19）；任一区缺失/歧义则不落标记。
+        // ---- 5. 初始化完成标记（PR11[7] + PR#14 评审修复）：骨架四区俱全 → 首次一次性落盘 ----
+        // pending（新代码骨架建成）与 legacy（旧文档骨架完整，收编入新机制）都落 done；
+        // 此后复盘区缺失即按用户删除纪律处理（不自动复活，AGENTS.md L19）；
+        // 任一区缺失/歧义则不落标记——legacy 缺失文档永远保持既有纪律。
         if (
-            !resolved.initDone &&
+            resolved.init !== "done" &&
             statsSectionId !== undefined &&
             notesPresent &&
             booksContainerId !== undefined &&

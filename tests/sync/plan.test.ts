@@ -116,8 +116,8 @@ describe("computePlan a) 首轮全量 creates 与稳定排序", () => {
 
     it("章节信息正确传递；无章节条目 chapter=undefined", () => {
         const p = plan(detail);
-        expect(p.creates[0].chapter).toEqual({ idx: 1, title: "第一章" });
-        expect(p.creates[2].chapter).toEqual({ idx: 2, title: "第二章" });
+        expect(p.creates[0].chapter).toEqual({ idx: 1, title: "第一章", uid: 1 });
+        expect(p.creates[2].chapter).toEqual({ idx: 2, title: "第二章", uid: 2 });
         expect(p.creates[3].chapter).toBeUndefined();
     });
 
@@ -291,7 +291,7 @@ describe("computePlan g) review 挂靠（双精确匹配）", () => {
         expect(rv1.payload).toBe(detail.reviews[0].raw);
         expect(rv1.renderedText).toBe(renderReviewChild("想法-rv-1"));
         // 挂靠 review 继承 highlight 的章节
-        expect(rv1.chapter).toEqual({ idx: 1, title: "第一章" });
+        expect(rv1.chapter).toEqual({ idx: 1, title: "第一章", uid: 1 });
     });
 
     it("无匹配 review：hint=undefined、chapter=undefined，排在章节化条目之后", () => {
@@ -310,7 +310,7 @@ describe("computePlan g) review 挂靠（双精确匹配）", () => {
         expect(p.creates).toHaveLength(1);
         expect(p.creates[0].officialSourceId).toBe("rv-new");
         expect(p.creates[0].matchedHighlightBlockHint).toBe("bm-1");
-        expect(p.creates[0].chapter).toEqual({ idx: 1, title: "第一章" });
+        expect(p.creates[0].chapter).toEqual({ idx: 1, title: "第一章", uid: 1 });
     });
 
     it("独立想法按 (createTime, reviewId) 排序", () => {

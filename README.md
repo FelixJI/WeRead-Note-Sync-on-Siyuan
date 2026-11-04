@@ -41,6 +41,20 @@ npm run dev        # watch 构建（开发调试）
 
 构建产物目录 `dist/` 即为标准思源插件包结构，可直接将其放入思源 `conf/plugins/` 或打成 zip 安装。
 
+## 发版
+
+发版完全由你**手动触发**（不依据提交自动发版）：
+
+1. 进入 GitHub 仓库 → **Actions** → **Release** → **Run workflow**，分支选 `main`，选择档位 **patch / minor / major**。
+2. 工作流依次执行：check / test → 在 `package.json` 与 `plugin.json` 当前版本上按档位递增 → 汇总**自上一 tag 以来的提交/PR** 生成本版更新日志（按 新增/修复/测试/文档/重构/其他 分组）→ 构建打包 → 提交 `chore(发版): 发布 vX.Y.Z` 并打 tag `vX.Y.Z` → 创建 GitHub Release。
+3. 产物命名：Release 附 `package.zip`（思源插件标准命名）与 `weread-note-sync-on-siyuan-vX.Y.Z.zip`（带插件名与版本号的副本）；`CHANGELOG.md` 随发版提交入库；CI 构建产物命名为 `dist-vX.Y.Z`。
+
+本地预演（只打印计划，不写任何文件）：
+
+```bash
+node scripts/release/run.mjs --bump minor --dry-run
+```
+
 ## 思源插件开发参考
 
 - 官方模板：[siyuan-note/plugin-sample-vite-svelte](https://github.com/siyuan-note/plugin-sample-vite-svelte)（本仓库脚手架参照其简化而来）

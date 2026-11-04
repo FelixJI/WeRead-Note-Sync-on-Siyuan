@@ -35,9 +35,15 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Read package version
+        id: ver
+        run: |
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      # 产物命名带版本号，便于多版本追溯（发版后与 Release/CHANGELOG 对应）
       - name: Upload dist artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dist
+          name: dist-v${{ steps.ver.outputs.version }}
           path: dist
           if-no-files-found: error

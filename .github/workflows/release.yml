@@ -1,0 +1,97 @@
+name: Release
+
+# 手动发版（Issue #16）：用户在 Actions 界面自行选择 patch/minor/major，不自动触发。
+# 流程：check/test → 计算版本 + 汇总提交/PR 生成更新日志 → 构建 package.zip →
+# 提交 chore(发版) + 打 tag → 创建 GitHub Release（package.zip + 带版本号副本）。
+# 发版同样不依赖真实 API Key（仓库安全不变量）；除内置 GITHUB_TOKEN 外不使用任何 secret。
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 版本档位（在当前版本基础上递增）
+        required: true
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+# 串行发版：同一时间至多一个发版任务，后到的排队而非取消（避免半成品状态）
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: check / test / build / changelog / tag / release
+    # 发版只在默认分支 main 上进行（版本文件与 tag 以 main 为准）
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout（全量历史与 tags，供更新日志汇总）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check (tsc + svelte-check)
+        run: npm run check
+
+      - name: Test (vitest, no real network)
+        run: npm test
+
+      - name: 计算版本并生成更新日志（同步双源版本号 + CHANGELOG.md）
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: node scripts/release/run.mjs --bump "$BUMP" --notes-out .ai-flow/runtime/release-notes.md
+
+      - name: 读取新版本号
+        id: ver
+        run: |
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Build & package（dist/plugin.json 带新版本号）
+        run: npm run make-package
+
+      - name: 生成带版本号副本（package.zip 保留思源集市标准命名）
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: cp package.zip "weread-note-sync-on-siyuan-v${VERSION}.zip"
+
+      - name: Commit & tag
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json plugin.json CHANGELOG.md
+          git commit -m "chore(发版): 发布 v${VERSION}"
+          git tag "v${VERSION}"
+
+      - name: Push（发版提交 + tag）
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: git push origin HEAD:main "refs/tags/v${VERSION}"
+
+      - name: Create GitHub Release（package.zip + 带版本号副本）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes-file .ai-flow/runtime/release-notes.md \
+            package.zip "weread-note-sync-on-siyuan-v${VERSION}.zip"
